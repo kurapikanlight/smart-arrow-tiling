@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.smart-arrow-tiling" path="/org/gnome/shell/extensions/smart-arrow-tiling/">
+    <key name="tile-left" type="as">
+      <default><![CDATA[['<Super>Left']]]></default>
+      <summary>Smart left</summary>
+    </key>
+    <key name="tile-right" type="as">
+      <default><![CDATA[['<Super>Right']]]></default>
+      <summary>Smart right</summary>
+    </key>
+    <key name="tile-up" type="as">
+      <default><![CDATA[['<Super>Up']]]></default>
+      <summary>Smart up</summary>
+    </key>
+    <key name="tile-down" type="as">
+      <default><![CDATA[['<Super>Down']]]></default>
+      <summary>Smart down</summary>
+    </key>
+
+    <key name="originals-saved" type="b">
+      <default>false</default>
+      <summary>Whether original GNOME shortcuts were saved</summary>
+    </key>
+    <key name="saved-tiled-left" type="as">
+      <default>[]</default>
+      <summary>Original Mutter left tiling shortcut</summary>
+    </key>
+    <key name="saved-tiled-right" type="as">
+      <default>[]</default>
+      <summary>Original Mutter right tiling shortcut</summary>
+    </key>
+    <key name="saved-maximize" type="as">
+      <default>[]</default>
+      <summary>Original maximize shortcut</summary>
+    </key>
+    <key name="saved-minimize" type="as">
+      <default>[]</default>
+      <summary>Original minimize shortcut</summary>
+    </key>
+  </schema>
+</schemalist>

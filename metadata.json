@@ -1,0 +1,8 @@
+{
+  "uuid": "smart-arrow-tiling@kafeyn",
+  "name": "Smart Arrow Tiling",
+  "description": "Windows-like Super+Arrow tiling for GNOME Shell 50. Adds smart window swapping, quarter tiling, 1/3 + 2/3 layouts, and automatic complementary resizing while preserving familiar Super+Arrow behavior.",
+  "shell-version": ["50"],
+  "settings-schema": "org.gnome.shell.extensions.smart-arrow-tiling",
+  "url": "https://github.com/kurapikanlight/smart-arrow-tiling"
+}
