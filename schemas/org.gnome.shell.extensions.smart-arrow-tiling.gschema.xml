@@ -1,42 +1,74 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<schemalist>
-  <schema id="org.gnome.shell.extensions.smart-arrow-tiling" path="/org/gnome/shell/extensions/smart-arrow-tiling/">
-    <key name="tile-left" type="as">
-      <default><![CDATA[['<Super>Left']]]></default>
-      <summary>Smart left</summary>
-    </key>
-    <key name="tile-right" type="as">
-      <default><![CDATA[['<Super>Right']]]></default>
-      <summary>Smart right</summary>
-    </key>
-    <key name="tile-up" type="as">
-      <default><![CDATA[['<Super>Up']]]></default>
-      <summary>Smart up</summary>
-    </key>
-    <key name="tile-down" type="as">
-      <default><![CDATA[['<Super>Down']]]></default>
-      <summary>Smart down</summary>
-    </key>
 
-    <key name="originals-saved" type="b">
-      <default>false</default>
-      <summary>Whether original GNOME shortcuts were saved</summary>
-    </key>
-    <key name="saved-tiled-left" type="as">
-      <default>[]</default>
-      <summary>Original Mutter left tiling shortcut</summary>
-    </key>
-    <key name="saved-tiled-right" type="as">
-      <default>[]</default>
-      <summary>Original Mutter right tiling shortcut</summary>
-    </key>
-    <key name="saved-maximize" type="as">
-      <default>[]</default>
-      <summary>Original maximize shortcut</summary>
-    </key>
-    <key name="saved-minimize" type="as">
-      <default>[]</default>
-      <summary>Original minimize shortcut</summary>
-    </key>
-  </schema>
+<schemalist>
+    <schema
+        id="org.gnome.shell.extensions.smart-arrow-tiling"
+        path="/org/gnome/shell/extensions/smart-arrow-tiling/">
+
+        <!-- Extension keybindings -->
+
+        <key name="tile-left" type="as">
+            <default>['&lt;Super&gt;Left']</default>
+            <summary>Tile left</summary>
+            <description>
+                Smart Arrow Tiling action for Super+Left.
+            </description>
+        </key>
+
+        <key name="tile-right" type="as">
+            <default>['&lt;Super&gt;Right']</default>
+            <summary>Tile right</summary>
+            <description>
+                Smart Arrow Tiling action for Super+Right.
+            </description>
+        </key>
+
+        <key name="tile-up" type="as">
+            <default>['&lt;Super&gt;Up']</default>
+            <summary>Tile up</summary>
+            <description>
+                Smart Arrow Tiling action for Super+Up.
+            </description>
+        </key>
+
+        <key name="tile-down" type="as">
+            <default>['&lt;Super&gt;Down']</default>
+            <summary>Tile down</summary>
+            <description>
+                Smart Arrow Tiling action for Super+Down.
+            </description>
+        </key>
+
+        <!-- Saved GNOME keybindings -->
+
+        <key name="originals-saved" type="b">
+            <default>false</default>
+            <summary>Original shortcuts saved</summary>
+            <description>
+                Tracks whether the original GNOME Shell shortcuts have been
+                saved so they can be restored when the extension is disabled.
+            </description>
+        </key>
+
+        <key name="saved-tiled-left" type="as">
+            <default>[]</default>
+            <summary>Saved native tile-left binding</summary>
+        </key>
+
+        <key name="saved-tiled-right" type="as">
+            <default>[]</default>
+            <summary>Saved native tile-right binding</summary>
+        </key>
+
+        <key name="saved-maximize" type="as">
+            <default>[]</default>
+            <summary>Saved native maximize binding</summary>
+        </key>
+
+        <key name="saved-minimize" type="as">
+            <default>[]</default>
+            <summary>Saved native minimize binding</summary>
+        </key>
+
+    </schema>
 </schemalist>
