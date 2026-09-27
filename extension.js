@@ -7,11 +7,12 @@ import Shell from 'gi://Shell';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-const VERSION = '9.0-smart-reflow';
+const VERSION = '10.0-gapless-linked-reflow';
 
 const SEQUENCE_TIMEOUT_MS = 750;
 const MULTIKEY_DELAY_MS = 320;
 const MANUAL_REFLOW_DELAY_MS = 40;
+const LIVE_REFLOW_INTERVAL_MS = 24;
 
 const OUTER_GAP = 1;
 const INNER_GAP = 1;
@@ -54,7 +55,9 @@ export default class SmartArrowTilingExtension extends Extension {
         this._animatedActors = new Set();
 
         this._grabStarts = new Map();
+        this._grabLastRects = new Map();
         this._manualReflowTimers = new Map();
+        this._grabLiveSignals = new Map();
 
         this._saveAndDisableNativeBindings();
 
@@ -145,6 +148,7 @@ export default class SmartArrowTilingExtension extends Extension {
         }
 
         this._stopAll();
+        this._disconnectAllGrabLiveSignals();
         this._stopAllManualReflowTimers();
         this._resetAllActorAnimations();
         this._restoreNativeBindings();
@@ -157,7 +161,9 @@ export default class SmartArrowTilingExtension extends Extension {
         this._timers = null;
         this._animatedActors = null;
         this._grabStarts = null;
+        this._grabLastRects = null;
         this._manualReflowTimers = null;
+        this._grabLiveSignals = null;
 
         this._clearSequence();
 
@@ -416,11 +422,8 @@ export default class SmartArrowTilingExtension extends Extension {
             );
 
         /*
-         * ROUTE 1 for newly opened/floating centered windows:
-         *
-         * Do NOT perform the first horizontal move immediately.
-         * Wait briefly so Super+Right,Up can be interpreted atomically
-         * and won't first swap a good tiled window into the floating rect.
+         * Floating/new windows are delayed so a two-key quarter command
+         * is interpreted atomically.
          */
         if (!tiled) {
             this._scheduleHorizontal(
@@ -445,8 +448,31 @@ export default class SmartArrowTilingExtension extends Extension {
             );
 
         /*
-         * Existing top/bottom stack:
-         * delay to allow Left/Right + Up/Down to swap stack slots.
+         * Any PARTIAL window gets a short delay before crossing columns.
+         * This is the important diagonal-swap fix:
+         *
+         *   A B        D B
+         *   C D   ->   C A
+         *
+         * Right+Down on A is planned as one operation instead of first
+         * swapping A/B and then moving A on top of D.
+         */
+        if (
+            !fullHeight &&
+            side !== direction
+        ) {
+            this._scheduleHorizontal(
+                win,
+                direction,
+                'cross'
+            );
+
+            return;
+        }
+
+        /*
+         * Existing top/bottom stack on the same side: delay so
+         * Left/Right + Up/Down can swap the vertical slots atomically.
          */
         if (
             !fullHeight &&
@@ -500,9 +526,8 @@ export default class SmartArrowTilingExtension extends Extension {
             );
 
             /*
-             * Floating/new centered window:
-             * insert directly into requested quarter without performing
-             * the intermediate half-swap first.
+             * Floating/new centered window: insert directly into the
+             * requested quarter without an intermediate half swap.
              */
             if (
                 pending.kind === 'floating'
@@ -520,17 +545,43 @@ export default class SmartArrowTilingExtension extends Extension {
             }
 
             /*
-             * Existing stacked pair:
-             * same-side + Up/Down swaps top/bottom.
+             * Partial window crossing columns: resolve the final slot in
+             * one plan. This makes diagonal A<->D style swaps literal and
+             * lets the vacated source column reflow at the same time.
              */
             if (
-                pending.kind === 'stack' &&
+                pending.kind === 'cross'
+            ) {
+                const vertical =
+                    direction === 'up'
+                        ? 'top'
+                        : 'bottom';
+
+                this._movePartialAcrossSides(
+                    win,
+                    pending.direction,
+                    vertical,
+                    pending.originRect,
+                    'atomic-cross-quarter'
+                );
+
+                this._clearSequence();
+
+                return;
+            }
+
+            /*
+             * Existing stacked pair: same-side + Up/Down swaps top/bottom.
+             */
+            if (
+                pending.kind === 'stack'
+            ) {
                 this._tryVerticalStackSwap(
                     win,
                     pending.direction,
                     direction
-                )
-            ) {
+                );
+
                 this._clearSequence();
 
                 return;
@@ -552,6 +603,39 @@ export default class SmartArrowTilingExtension extends Extension {
         ) {
             const horizontal =
                 this._lastHorizontal;
+
+            const area =
+                this._screenArea(win);
+
+            const rect =
+                this._effectiveRect(win);
+
+            /*
+             * If the horizontal operation left us in a real stack, swap
+             * the slot instead of blindly placing one window over another.
+             */
+            if (
+                !this._isFullHeight(rect, area) &&
+                this._tryVerticalStackSwap(
+                    win,
+                    horizontal,
+                    direction
+                )
+            ) {
+                this._clearSequence();
+                return;
+            }
+
+            /*
+             * Do not turn the only full-height window in a column into a
+             * lone quarter; that would deliberately create a black hole.
+             */
+            if (
+                this._isFullHeight(rect, area)
+            ) {
+                this._clearSequence();
+                return;
+            }
 
             this._tileQuarter(
                 win,
@@ -1400,11 +1484,16 @@ export default class SmartArrowTilingExtension extends Extension {
                 existingTotal
             );
 
+        const minimumSplit =
+            usableHeight >= MIN_REGION_SIZE * 2
+                ? MIN_REGION_SIZE
+                : 1;
+
         topHeight =
             Math.max(
-                1,
+                minimumSplit,
                 Math.min(
-                    usableHeight - 1,
+                    usableHeight - minimumSplit,
                     topHeight
                 )
             );
@@ -1452,9 +1541,428 @@ export default class SmartArrowTilingExtension extends Extension {
         );
     }
 
+    _layoutRegionsFromSource(
+        area,
+        sourceSide,
+        sourceEntries
+    ) {
+        const bounds =
+            this._innerBounds(area);
+
+        const halves =
+            this._halves(area);
+
+        if (!sourceEntries.length)
+            return halves;
+
+        let splitX;
+
+        if (sourceSide === 'left') {
+            const sourceRight =
+                Math.max(
+                    ...sourceEntries.map(
+                        entry =>
+                            entry.rect.x
+                            + entry.rect.width
+                    )
+                );
+
+            splitX =
+                Math.round(sourceRight);
+
+        } else {
+            const sourceLeft =
+                Math.min(
+                    ...sourceEntries.map(
+                        entry =>
+                            entry.rect.x
+                    )
+                );
+
+            splitX =
+                Math.round(
+                    sourceLeft
+                    - INNER_GAP
+                );
+        }
+
+        splitX =
+            Math.max(
+                bounds.left + MIN_REGION_SIZE,
+                Math.min(
+                    bounds.right
+                    - INNER_GAP
+                    - MIN_REGION_SIZE,
+                    splitX
+                )
+            );
+
+        return {
+            left: {
+                x:
+                    bounds.left,
+
+                y:
+                    bounds.top,
+
+                width:
+                    splitX
+                    - bounds.left,
+
+                height:
+                    bounds.bottom
+                    - bounds.top,
+            },
+
+            right: {
+                x:
+                    splitX
+                    + INNER_GAP,
+
+                y:
+                    bounds.top,
+
+                width:
+                    bounds.right
+                    - splitX
+                    - INNER_GAP,
+
+                height:
+                    bounds.bottom
+                    - bounds.top,
+            },
+        };
+    }
+
+    _splitVerticalRegion(
+        region,
+        topFraction = 0.5
+    ) {
+        const usable =
+            Math.max(
+                2,
+                region.height
+                - INNER_GAP
+            );
+
+        const minFraction =
+            Math.min(
+                0.45,
+                MIN_REGION_SIZE
+                / Math.max(1, usable)
+            );
+
+        const fraction =
+            Math.max(
+                minFraction,
+                Math.min(
+                    1 - minFraction,
+                    topFraction
+                )
+            );
+
+        let topHeight =
+            Math.round(
+                usable
+                * fraction
+            );
+
+        topHeight =
+            Math.max(
+                1,
+                Math.min(
+                    usable - 1,
+                    topHeight
+                )
+            );
+
+        const bottomHeight =
+            usable
+            - topHeight;
+
+        return {
+            top: {
+                x:
+                    region.x,
+
+                y:
+                    region.y,
+
+                width:
+                    region.width,
+
+                height:
+                    topHeight,
+            },
+
+            bottom: {
+                x:
+                    region.x,
+
+                y:
+                    region.y
+                    + topHeight
+                    + INNER_GAP,
+
+                width:
+                    region.width,
+
+                height:
+                    bottomHeight,
+            },
+        };
+    }
+
+    _entryWithRect(
+        entry,
+        rect
+    ) {
+        return {
+            ...entry,
+            rect: {
+                ...rect,
+            },
+        };
+    }
+
+    _movePartialAcrossSides(
+        win,
+        targetSide,
+        targetVertical,
+        originRect = null,
+        label = 'partial-cross'
+    ) {
+        const area =
+            this._screenArea(win);
+
+        const currentRect =
+            originRect
+            ? {...originRect}
+            : {...this._effectiveRect(win)};
+
+        const sourceSide =
+            this._dominantSide(
+                currentRect,
+                area
+            );
+
+        if (
+            sourceSide === targetSide
+        ) {
+            const verticalKey =
+                targetVertical === 'top'
+                    ? 'up'
+                    : 'down';
+
+            if (
+                this._tryVerticalStackSwap(
+                    win,
+                    targetSide,
+                    verticalKey
+                )
+            ) {
+                return;
+            }
+
+            return;
+        }
+
+        const currentVertical =
+            this._verticalSlot(
+                currentRect,
+                area
+            );
+
+        const currentEntry = {
+            win,
+            rect: {
+                ...currentRect,
+            },
+            side:
+                sourceSide,
+            vertical:
+                currentVertical,
+            fullHeight:
+                false,
+        };
+
+        const peers =
+            this._candidateEntries(
+                win,
+                area
+            );
+
+        const sourceOthers =
+            this._entriesOnSide(
+                peers,
+                sourceSide
+            );
+
+        const destination =
+            this._entriesOnSide(
+                peers,
+                targetSide
+            );
+
+        const oldSourceGroup =
+            [
+                currentEntry,
+                ...sourceOthers,
+            ];
+
+        const regions =
+            this._layoutRegionsFromSource(
+                area,
+                sourceSide,
+                oldSourceGroup
+            );
+
+        const sourceRegion =
+            regions[sourceSide];
+
+        const targetRegion =
+            regions[targetSide];
+
+        let victim = null;
+
+        if (
+            destination.length >= 2
+        ) {
+            victim =
+                destination.find(
+                    entry =>
+                        !entry.fullHeight
+                        && entry.vertical
+                        === targetVertical
+                )
+                ?? destination.find(
+                    entry =>
+                        entry.vertical
+                        === targetVertical
+                )
+                ?? destination[0];
+
+        } else if (
+            destination.length === 1
+            && !destination[0].fullHeight
+            && destination[0].vertical
+            === targetVertical
+        ) {
+            victim =
+                destination[0];
+        }
+
+        const sourceAfter =
+            [...sourceOthers];
+
+        const targetAfter =
+            destination.filter(
+                entry =>
+                    entry !== victim
+            );
+
+        if (victim) {
+            sourceAfter.push(
+                this._entryWithRect(
+                    victim,
+                    currentRect
+                )
+            );
+        }
+
+        let sourceTopFraction =
+            0.5;
+
+        const sourceUsableHeight =
+            Math.max(
+                2,
+                sourceRegion.height
+                - INNER_GAP
+            );
+
+        if (
+            currentVertical === 'top'
+        ) {
+            sourceTopFraction =
+                currentRect.height
+                / sourceUsableHeight;
+        } else {
+            sourceTopFraction =
+                1
+                - currentRect.height
+                / sourceUsableHeight;
+        }
+
+        const targetSlots =
+            this._splitVerticalRegion(
+                targetRegion,
+                sourceTopFraction
+            );
+
+        if (
+            targetAfter.length === 1
+        ) {
+            targetAfter[0] =
+                this._entryWithRect(
+                    targetAfter[0],
+                    targetSlots[
+                        targetVertical === 'top'
+                            ? 'bottom'
+                            : 'top'
+                    ]
+                );
+        }
+
+        const currentTargetHint =
+            victim
+                ? victim.rect
+                : targetSlots[targetVertical];
+
+        targetAfter.push({
+            ...currentEntry,
+            rect: {
+                ...currentTargetHint,
+            },
+            side:
+                targetSide,
+            vertical:
+                targetVertical,
+        });
+
+        const plan = [];
+
+        if (
+            sourceAfter.length >= 1
+            && sourceAfter.length <= 2
+        ) {
+            this._fitWindowsIntoRegion(
+                plan,
+                sourceAfter,
+                sourceRegion
+            );
+        }
+
+        if (
+            targetAfter.length >= 1
+            && targetAfter.length <= 2
+        ) {
+            this._fitWindowsIntoRegion(
+                plan,
+                targetAfter,
+                targetRegion
+            );
+        }
+
+        this._executePlan(
+            plan,
+            `${label}-${sourceSide}-to-${targetSide}-${targetVertical}`
+        );
+    }
+
     _executePlan(
         plan,
-        label
+        label,
+        animate = true
     ) {
         if (!plan.length)
             return;
@@ -1502,7 +2010,8 @@ export default class SmartArrowTilingExtension extends Extension {
                 move.rect,
                 starts.get(
                     move.win.get_id()
-                )
+                ),
+                animate
             );
         }
     }
@@ -1810,28 +2319,35 @@ export default class SmartArrowTilingExtension extends Extension {
         const plan = [];
 
         /*
-         * Same side = normalize back to 50/50.
-         *
-         * Works for:
-         * 1/3 + one window
-         * 1/3 + two stacked windows
+         * Same side: normalize a full-height/third layout. A partial window
+         * that belongs to a stack is normally delayed by _onHorizontal(),
+         * so it does not destroy its sibling layout here.
          */
         if (
             sourceSide === direction
         ) {
+            if (!currentFull) {
+                return;
+            }
+
             const opposite =
                 this._opposite(
                     direction
                 );
 
+            const oppositeEntries =
+                this._entriesOnSide(
+                    peers,
+                    opposite
+                );
+
             if (
-                peers.length >= 1
-                &&
-                peers.length <= 2
+                oppositeEntries.length >= 1
+                && oppositeEntries.length <= 2
             ) {
                 this._fitWindowsIntoRegion(
                     plan,
-                    peers,
+                    oppositeEntries,
                     halves[opposite]
                 );
             }
@@ -1850,6 +2366,30 @@ export default class SmartArrowTilingExtension extends Extension {
             return;
         }
 
+        /*
+         * Partial windows use one shared reflow planner. It keeps the
+         * existing column divider, swaps the requested slot when occupied,
+         * expands a lone survivor to full height, and never leaves the
+         * vacated slot black.
+         */
+        if (!currentFull) {
+            const vertical =
+                this._verticalSlot(
+                    currentRect,
+                    area
+                );
+
+            this._movePartialAcrossSides(
+                win,
+                direction,
+                vertical,
+                currentRect,
+                'horizontal-cross'
+            );
+
+            return;
+        }
+
         const destination =
             this._entriesOnSide(
                 peers,
@@ -1857,178 +2397,57 @@ export default class SmartArrowTilingExtension extends Extension {
             );
 
         /*
-         * Full-height column crosses to other side:
-         * swap the whole destination group into the region being vacated.
+         * Full-height column crosses to the other side. Use the existing
+         * divider as the source of truth so a partial destination is first
+         * normalized to a full column instead of preserving a black hole.
          */
-        if (
-            currentFull
-        ) {
-            if (
-                destination.length >= 1
-                &&
-                destination.length <= 2
-            ) {
-                const destinationRegion =
-                    this._unionRect(
-                        destination
-                    );
+        const currentEntry = {
+            win,
+            rect: {
+                ...currentRect,
+            },
+        };
 
-                this._fitWindowsIntoRegion(
-                    plan,
-                    destination,
-                    currentRect
-                );
-
-                this._pushMove(
-                    plan,
-                    win,
-                    destinationRegion
-                );
-
-                this._executePlan(
-                    plan,
-                    `swap-full-${sourceSide}-to-${direction}`
-                );
-
-                return;
-            }
-
-            this._pushMove(
-                plan,
-                win,
-                halves[direction]
+        const regions =
+            this._layoutRegionsFromSource(
+                area,
+                sourceSide,
+                [currentEntry]
             );
 
-            this._executePlan(
-                plan,
-                `move-full-to-${direction}`
-            );
-
-            return;
-        }
-
-        /*
-         * Partial vs full: literal position swap.
-         */
         if (
-            destination.length === 1
-            &&
-            destination[0].fullHeight
+            destination.length >= 1
+            && destination.length <= 2
         ) {
-            const victim =
-                destination[0];
-
-            this._pushMove(
+            this._fitWindowsIntoRegion(
                 plan,
-                victim.win,
-                currentRect
+                destination,
+                regions[sourceSide]
             );
 
             this._pushMove(
                 plan,
                 win,
-                victim.rect
+                regions[direction]
             );
 
             this._executePlan(
                 plan,
-                `swap-partial-with-full-${sourceSide}-to-${direction}`
+                `swap-full-${sourceSide}-to-${direction}`
             );
 
             return;
         }
-
-        /*
-         * Partial vs two-window stack:
-         * swap matching top/bottom slot.
-         */
-        if (
-            destination.length === 2
-        ) {
-            const vertical =
-                this._verticalSlot(
-                    currentRect,
-                    area
-                );
-
-            const victim =
-                destination.find(
-                    entry =>
-                        entry.vertical
-                        === vertical
-                )
-                ??
-                destination[0];
-
-            this._pushMove(
-                plan,
-                victim.win,
-                currentRect
-            );
-
-            this._pushMove(
-                plan,
-                win,
-                victim.rect
-            );
-
-            this._executePlan(
-                plan,
-                `swap-${vertical}-slot-${sourceSide}-to-${direction}`
-            );
-
-            return;
-        }
-
-        if (
-            destination.length === 1
-        ) {
-            const victim =
-                destination[0];
-
-            this._pushMove(
-                plan,
-                victim.win,
-                currentRect
-            );
-
-            this._pushMove(
-                plan,
-                win,
-                victim.rect
-            );
-
-            this._executePlan(
-                plan,
-                `swap-single-slot-${sourceSide}-to-${direction}`
-            );
-
-            return;
-        }
-
-        /*
-         * Empty destination:
-         * preserve top/bottom slot.
-         */
-        const vertical =
-            this._verticalSlot(
-                currentRect,
-                area
-            );
 
         this._pushMove(
             plan,
             win,
-            this._quarter(
-                area,
-                direction,
-                vertical
-            )
+            halves[direction]
         );
 
         this._executePlan(
             plan,
-            `move-partial-to-${direction}-${vertical}`
+            `move-full-to-${direction}`
         );
     }
 
@@ -2165,6 +2584,14 @@ export default class SmartArrowTilingExtension extends Extension {
                 area
             );
 
+        /*
+         * A 1/3 + 2/3 layout supports at most three tiled windows total.
+         * With four windows, collapsing only the focused window would
+         * overlap or uncover another slot, so preserve the gapless grid.
+         */
+        if (peers.length > 2)
+            return;
+
         const plan = [];
 
         this._pushMove(
@@ -2201,29 +2628,81 @@ export default class SmartArrowTilingExtension extends Extension {
         verticalKey
     ) {
         const area =
-            this._screenArea(
-                win
-            );
+            this._screenArea(win);
+
+        const rect =
+            this._effectiveRect(win);
 
         const vertical =
             verticalKey === 'up'
                 ? 'top'
                 : 'bottom';
 
-        this._executePlan(
-            [
-                {
-                    win,
+        if (
+            !this._isLikelyTiled(
+                rect,
+                area
+            )
+        ) {
+            this._executePlan(
+                [
+                    {
+                        win,
+                        rect:
+                            this._quarter(
+                                area,
+                                horizontal,
+                                vertical
+                            ),
+                    },
+                ],
+                `${horizontal}-${vertical}`
+            );
 
-                    rect:
-                        this._quarter(
-                            area,
-                            horizontal,
-                            vertical
-                        ),
-                },
-            ],
-            `${horizontal}-${vertical}`
+            return;
+        }
+
+        if (
+            this._isFullHeight(
+                rect,
+                area
+            )
+        ) {
+            /* A lone full column stays full instead of creating an empty half. */
+            return;
+        }
+
+        const side =
+            this._dominantSide(
+                rect,
+                area
+            );
+
+        if (side !== horizontal) {
+            this._movePartialAcrossSides(
+                win,
+                horizontal,
+                vertical,
+                rect,
+                'quarter-cross'
+            );
+
+            return;
+        }
+
+        const currentVertical =
+            this._verticalSlot(
+                rect,
+                area
+            );
+
+        if (currentVertical === vertical)
+            return;
+
+        this._tryVerticalStackSwap(
+            win,
+            horizontal,
+            verticalKey
         );
     }
 
@@ -2240,13 +2719,33 @@ export default class SmartArrowTilingExtension extends Extension {
             return;
         }
 
+        /*
+         * A manual resize must win immediately over an old keyboard snap.
+         * Otherwise the convergence timer can keep pulling the window back
+         * while the user is dragging its divider.
+         */
+        this._cancelJob(win);
+        this._cancelManualReflowTimer(win);
+        this._resetActorAnimation(win);
+
         try {
+            const rect = {
+                ...win.get_frame_rect(),
+            };
+
             this._grabStarts.set(
                 win.get_id(),
+                rect
+            );
+
+            this._grabLastRects?.set(
+                win.get_id(),
                 {
-                    ...win.get_frame_rect(),
+                    ...rect,
                 }
             );
+
+            this._connectGrabLiveSignals(win);
 
         } catch (_) {
         }
@@ -2264,10 +2763,17 @@ export default class SmartArrowTilingExtension extends Extension {
         const id =
             win.get_id();
 
+        this._disconnectGrabLiveSignals(win);
+
         const before =
             this._grabStarts.get(id);
 
+        const last =
+            this._grabLastRects?.get(id)
+            ?? before;
+
         this._grabStarts.delete(id);
+        this._grabLastRects?.delete(id);
 
         if (!before)
             return;
@@ -2282,27 +2788,46 @@ export default class SmartArrowTilingExtension extends Extension {
             return;
         }
 
-        const widthChanged =
+        const widthChangedFromStart =
             Math.abs(
                 after.width
                 - before.width
             );
 
-        const heightChanged =
+        const heightChangedFromStart =
             Math.abs(
                 after.height
                 - before.height
             );
 
+        const widthChangedFromLast =
+            Math.abs(
+                after.width
+                - last.width
+            );
+
+        const heightChangedFromLast =
+            Math.abs(
+                after.height
+                - last.height
+            );
+
         /*
-         * Pure window move:
-         * do nothing.
+         * Pure move with no resize at any point: nothing to repair. If the
+         * user resized and then returned to the original size, the live pass
+         * already restored peers; a pending final delta is still handled.
          */
         if (
-            widthChanged
+            widthChangedFromStart
             < RESIZE_CHANGE_TOLERANCE
             &&
-            heightChanged
+            heightChangedFromStart
+            < RESIZE_CHANGE_TOLERANCE
+            &&
+            widthChangedFromLast
+            < RESIZE_CHANGE_TOLERANCE
+            &&
+            heightChangedFromLast
             < RESIZE_CHANGE_TOLERANCE
         ) {
             return;
@@ -2333,7 +2858,7 @@ export default class SmartArrowTilingExtension extends Extension {
 
                     this._autoComplementAfterManualResize(
                         win,
-                        before,
+                        last,
                         settled
                     );
 
@@ -2378,20 +2903,35 @@ export default class SmartArrowTilingExtension extends Extension {
                 - before.height
             );
 
-        /*
-         * Corner resize:
-         * whichever dimension changed more decides the reflow direction.
-         */
-        if (
+        const horizontalChanged =
             widthChanged
-            >= heightChanged
-        ) {
+            >= RESIZE_CHANGE_TOLERANCE;
+
+        const verticalChanged =
+            heightChanged
+            >= RESIZE_CHANGE_TOLERANCE;
+
+        /*
+         * Treat width and height independently. A corner resize can change
+         * both dividers, so both complementary reflows are allowed to run.
+         *
+         * Horizontal reflow:
+         * - same-column windows inherit the dragged x/width
+         * - the opposite column consumes the remaining screen width
+         *
+         * Vertical reflow:
+         * - only the sibling in this column follows the top/bottom divider
+         * - the other column keeps its own top/bottom split
+         */
+        if (horizontalChanged) {
             this._autoComplementHorizontalResize(
                 win,
                 area,
                 after
             );
-        } else {
+        }
+
+        if (verticalChanged) {
             this._autoComplementVerticalResize(
                 win,
                 area,
@@ -2590,7 +3130,8 @@ export default class SmartArrowTilingExtension extends Extension {
 
         this._executePlan(
             plan,
-            `manual-horizontal-reflow-${side}`
+            `manual-horizontal-reflow-${side}`,
+            false
         );
     }
 
@@ -2723,7 +3264,182 @@ export default class SmartArrowTilingExtension extends Extension {
 
         this._executePlan(
             plan,
-            `manual-vertical-reflow-${side}`
+            `manual-vertical-reflow-${side}`,
+            false
+        );
+    }
+
+    _connectGrabLiveSignals(win) {
+        if (
+            !win
+            ||
+            !this._grabLiveSignals
+        ) {
+            return;
+        }
+
+        this._disconnectGrabLiveSignals(win);
+
+        const ids = [];
+
+        const schedule = () => {
+            this._scheduleLiveManualReflow(win);
+        };
+
+        for (
+            const signal
+            of [
+                'size-changed',
+                'position-changed',
+            ]
+        ) {
+            try {
+                ids.push(
+                    win.connect(
+                        signal,
+                        schedule
+                    )
+                );
+            } catch (_) {
+            }
+        }
+
+        if (ids.length) {
+            this._grabLiveSignals.set(
+                win.get_id(),
+                {
+                    win,
+                    ids,
+                }
+            );
+        }
+    }
+
+    _disconnectGrabLiveSignals(win) {
+        if (
+            !win
+            ||
+            !this._grabLiveSignals
+        ) {
+            return;
+        }
+
+        const id =
+            win.get_id();
+
+        const record =
+            this._grabLiveSignals.get(id);
+
+        if (!record)
+            return;
+
+        for (
+            const signalId
+            of record.ids
+        ) {
+            try {
+                record.win.disconnect(
+                    signalId
+                );
+            } catch (_) {
+            }
+        }
+
+        this._grabLiveSignals.delete(id);
+    }
+
+    _disconnectAllGrabLiveSignals() {
+        if (!this._grabLiveSignals)
+            return;
+
+        for (
+            const record
+            of this._grabLiveSignals.values()
+        ) {
+            for (
+                const signalId
+                of record.ids
+            ) {
+                try {
+                    record.win.disconnect(
+                        signalId
+                    );
+                } catch (_) {
+                }
+            }
+        }
+
+        this._grabLiveSignals.clear();
+    }
+
+    _scheduleLiveManualReflow(win) {
+        if (
+            !win
+            ||
+            !this._manualReflowTimers
+            ||
+            !this._grabStarts
+            ||
+            !this._grabLastRects
+        ) {
+            return;
+        }
+
+        const id =
+            win.get_id();
+
+        if (
+            this._manualReflowTimers.has(id)
+        ) {
+            return;
+        }
+
+        const sourceId =
+            GLib.timeout_add(
+                GLib.PRIORITY_DEFAULT,
+                LIVE_REFLOW_INTERVAL_MS,
+                () => {
+                    this._manualReflowTimers
+                        ?.delete(id);
+
+                    const before =
+                        this._grabLastRects
+                            ?.get(id);
+
+                    if (!before)
+                        return GLib.SOURCE_REMOVE;
+
+                    let current;
+
+                    try {
+                        current = {
+                            ...win.get_frame_rect(),
+                        };
+                    } catch (_) {
+                        return GLib.SOURCE_REMOVE;
+                    }
+
+                    this._autoComplementAfterManualResize(
+                        win,
+                        before,
+                        current
+                    );
+
+                    this._grabLastRects
+                        ?.set(
+                            id,
+                            {
+                                ...current,
+                            }
+                        );
+
+                    return GLib.SOURCE_REMOVE;
+                }
+            );
+
+        this._manualReflowTimers.set(
+            id,
+            sourceId
         );
     }
 
@@ -2784,6 +3500,7 @@ export default class SmartArrowTilingExtension extends Extension {
 
         this._manualReflowTimers.clear();
         this._grabStarts?.clear();
+        this._grabLastRects?.clear();
     }
 
     // =========================================================
@@ -2931,7 +3648,8 @@ export default class SmartArrowTilingExtension extends Extension {
     _requestGeometry(
         win,
         rect,
-        fromRect = null
+        fromRect = null,
+        animate = true
     ) {
         if (
             !win
@@ -2985,7 +3703,8 @@ export default class SmartArrowTilingExtension extends Extension {
                     win.get_frame_rect(),
 
                 animate:
-                    !wasMaximized,
+                    animate
+                    && !wasMaximized,
             }
         );
 
