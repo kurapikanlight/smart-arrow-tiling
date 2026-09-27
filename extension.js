@@ -199,8 +199,8 @@ export default class SmartArrowTilingExtension extends Extension {
 
         this._mutterKeys.set_strv('toggle-tiled-left', []);
         this._mutterKeys.set_strv('toggle-tiled-right', []);
-        this._wmKeys.set_strv('maximize', []);
-        this._wmKeys.set_strv('minimize', []);
+        this._wmKeys.set_strv('maximize', ['<Alt>Up']);
+        this._wmKeys.set_strv('minimize', ['<Alt>Down']);
     }
 
     _restoreNativeBindings() {
