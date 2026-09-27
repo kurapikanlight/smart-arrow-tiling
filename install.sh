@@ -1,152 +1,108 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
 
-# ============================================================
-# Smart Arrow Tiling
-# GNOME Shell Extension Installer
-#
-# UUID:
-# smart-arrow-tiling@kafeyn_
-# ============================================================
-
 UUID="smart-arrow-tiling@kafeyn"
-REPO="kurapikanlight/smart-arrow-tiling"
-BRANCH="main"
+SCHEMA="org.gnome.shell.extensions.smart-arrow-tiling"
+EXT_DIR="$HOME/.local/share/gnome-shell/extensions/$UUID"
+REPO_RAW="https://raw.githubusercontent.com/kurapikanlight/smart-arrow-tiling/main"
 
-INSTALL_DIR="$HOME/.local/share/gnome-shell/extensions/$UUID"
-SCHEMA_DIR="$INSTALL_DIR/schemas"
+say() {
+    printf '%s\n' "$*"
+}
 
-RAW_URL="https://raw.githubusercontent.com/$REPO/$BRANCH"
+need() {
+    command -v "$1" >/dev/null 2>&1 || {
+        printf 'Missing required command: %s\n' "$1" >&2
+        exit 1
+    }
+}
 
-echo
-echo "=========================================="
-echo " Smart Arrow Tiling"
-echo " GNOME Shell Extension Installer"
-echo "=========================================="
-echo
+need gsettings
+need gnome-extensions
+need glib-compile-schemas
 
-# ------------------------------------------------------------
-# Check dependencies
-# ------------------------------------------------------------
+# Disable the old copy before replacing files. Ignore "not installed" errors.
+gnome-extensions disable "$UUID" >/dev/null 2>&1 || true
 
-if ! command -v curl >/dev/null 2>&1; then
-    echo "Error: curl is required."
-    echo
-    echo "Fedora:"
-    echo "  sudo dnf install curl"
-    echo
-    exit 1
-fi
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+mkdir -p "$TMP_DIR/schemas"
 
-if ! command -v glib-compile-schemas >/dev/null 2>&1; then
-    echo "Error: glib-compile-schemas is required."
-    echo
-    echo "Fedora:"
-    echo "  sudo dnf install glib2"
-    echo
-    exit 1
-fi
+# When run from a cloned repository, install those exact local files.
+# When piped through curl, fetch the current files from GitHub.
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
 
-# ------------------------------------------------------------
-# Show GNOME version
-# ------------------------------------------------------------
-
-if command -v gnome-shell >/dev/null 2>&1; then
-    echo "Detected:"
-    gnome-shell --version || true
-    echo
-fi
-
-# ------------------------------------------------------------
-# Create extension directory
-# ------------------------------------------------------------
-
-echo "[1/5] Creating extension directory..."
-
-mkdir -p "$INSTALL_DIR"
-mkdir -p "$SCHEMA_DIR"
-
-# ------------------------------------------------------------
-# Download extension.js
-# ------------------------------------------------------------
-
-echo "[2/5] Downloading extension.js..."
-
-curl \
-    -fsSL \
-    "$RAW_URL/extension.js" \
-    -o "$INSTALL_DIR/extension.js"
-
-# ------------------------------------------------------------
-# Download metadata.json
-# ------------------------------------------------------------
-
-echo "[3/5] Downloading metadata.json..."
-
-curl \
-    -fsSL \
-    "$RAW_URL/metadata.json" \
-    -o "$INSTALL_DIR/metadata.json"
-
-# ------------------------------------------------------------
-# Download schema
-# ------------------------------------------------------------
-
-echo "[4/5] Downloading GSettings schema..."
-
-curl \
-    -fsSL \
-    "$RAW_URL/schemas/org.gnome.shell.extensions.smart-arrow-tiling.gschema.xml" \
-    -o "$SCHEMA_DIR/org.gnome.shell.extensions.smart-arrow-tiling.gschema.xml"
-
-# ------------------------------------------------------------
-# Compile schema
-# ------------------------------------------------------------
-
-echo "[5/5] Compiling GSettings schema..."
-
-glib-compile-schemas "$SCHEMA_DIR"
-
-# ------------------------------------------------------------
-# Enable extension if possible
-# ------------------------------------------------------------
-
-echo
-echo "Installation completed successfully."
-echo
-
-if command -v gnome-extensions >/dev/null 2>&1; then
-
-    echo "Trying to enable Smart Arrow Tiling..."
-
-    if gnome-extensions enable "$UUID" 2>/dev/null; then
-        echo
-        echo "Smart Arrow Tiling is enabled."
-    else
-        echo
-        echo "The extension was installed, but GNOME Shell"
-        echo "has not loaded it yet."
-        echo
-        echo "Log out and log back in, then run:"
-        echo
-        echo "  gnome-extensions enable $UUID"
-    fi
-
+if [[ -n "$SCRIPT_DIR" \
+      && -f "$SCRIPT_DIR/extension.js" \
+      && -f "$SCRIPT_DIR/metadata.json" \
+      && -f "$SCRIPT_DIR/schemas/org.gnome.shell.extensions.smart-arrow-tiling.gschema.xml" ]]; then
+    cp "$SCRIPT_DIR/extension.js" "$TMP_DIR/extension.js"
+    cp "$SCRIPT_DIR/metadata.json" "$TMP_DIR/metadata.json"
+    cp "$SCRIPT_DIR/schemas/org.gnome.shell.extensions.smart-arrow-tiling.gschema.xml" \
+       "$TMP_DIR/schemas/org.gnome.shell.extensions.smart-arrow-tiling.gschema.xml"
 else
-    echo "gnome-extensions command was not found."
-    echo
-    echo "After logging back into GNOME, enable:"
-    echo
-    echo "  $UUID"
+    need curl
+    curl -fsSL "$REPO_RAW/extension.js" -o "$TMP_DIR/extension.js"
+    curl -fsSL "$REPO_RAW/metadata.json" -o "$TMP_DIR/metadata.json"
+    curl -fsSL \
+        "$REPO_RAW/schemas/org.gnome.shell.extensions.smart-arrow-tiling.gschema.xml" \
+        -o "$TMP_DIR/schemas/org.gnome.shell.extensions.smart-arrow-tiling.gschema.xml"
 fi
 
-echo
-echo "Installed to:"
-echo
-echo "  $INSTALL_DIR"
-echo
-echo "------------------------------------------"
-echo " Smart Arrow Tiling installation complete"
-echo "------------------------------------------"
-echo
+# Clean install: do not leave old JS, old schemas, or compiled schema files behind.
+rm -rf "$EXT_DIR"
+mkdir -p "$EXT_DIR/schemas"
+cp "$TMP_DIR/extension.js" "$EXT_DIR/extension.js"
+cp "$TMP_DIR/metadata.json" "$EXT_DIR/metadata.json"
+cp "$TMP_DIR/schemas/org.gnome.shell.extensions.smart-arrow-tiling.gschema.xml" \
+   "$EXT_DIR/schemas/org.gnome.shell.extensions.smart-arrow-tiling.gschema.xml"
+
+glib-compile-schemas --strict "$EXT_DIR/schemas"
+
+# ------------------------------------------------------------
+# Permanent key ownership
+# ------------------------------------------------------------
+# GNOME owns only Alt+Up / Alt+Down for maximize/minimize.
+# Remove GNOME's native Super+Arrow tiling so Smart Arrow is the
+# only owner of Super+Left/Right/Up/Down.
+gsettings set org.gnome.desktop.wm.keybindings maximize "['<Alt>Up']"
+gsettings set org.gnome.desktop.wm.keybindings minimize "['<Alt>Down']"
+gsettings set org.gnome.desktop.wm.keybindings unmaximize "@as []"
+gsettings set org.gnome.mutter.keybindings toggle-tiled-left "@as []"
+gsettings set org.gnome.mutter.keybindings toggle-tiled-right "@as []"
+
+# Clear old Smart Arrow settings from previous versions, including
+# the old saved/restore binding state, then force the clean defaults.
+GSETTINGS_SCHEMA_DIR="$EXT_DIR/schemas" \
+    gsettings reset-recursively "$SCHEMA" || true
+
+GSETTINGS_SCHEMA_DIR="$EXT_DIR/schemas" \
+    gsettings set "$SCHEMA" tile-left "['<Super>Left']"
+GSETTINGS_SCHEMA_DIR="$EXT_DIR/schemas" \
+    gsettings set "$SCHEMA" tile-right "['<Super>Right']"
+GSETTINGS_SCHEMA_DIR="$EXT_DIR/schemas" \
+    gsettings set "$SCHEMA" tile-up "['<Super>Up']"
+GSETTINGS_SCHEMA_DIR="$EXT_DIR/schemas" \
+    gsettings set "$SCHEMA" tile-down "['<Super>Down']"
+
+say ""
+say "Smart Arrow Tiling installed cleanly."
+say ""
+say "GNOME:"
+say "  Alt+Up    -> maximize"
+say "  Alt+Down  -> minimize"
+say ""
+say "Smart Arrow Tiling:"
+say "  Super+Left / Super+Right       -> horizontal smart tiling"
+say "  Super+Left/Right then Up/Down -> quarter movement"
+say "  Super+Left/Right twice         -> 1/3 + 2/3"
+say "  standalone Super+Up/Down       -> intentionally no action"
+say ""
+
+if gnome-extensions enable "$UUID" >/dev/null 2>&1; then
+    say "Extension enabled."
+else
+    say "GNOME has not loaded the freshly installed extension yet."
+    say "Log out and back in once, then run:"
+    say "  gnome-extensions enable $UUID"
+fi
