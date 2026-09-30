@@ -2,8 +2,7 @@
 set -euo pipefail
 
 UUID="smart-arrow-tiling@kafeyn"
-SCHEMA="org.gnome.shell.extensions.smart-arrow-tiling"
-EXT_DIR="$HOME/.local/share/gnome-shell/extensions/$UUID"
+EXT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/$UUID"
 REPO_RAW="https://raw.githubusercontent.com/kurapikanlight/smart-arrow-tiling/main"
 
 say() {
@@ -17,12 +16,8 @@ need() {
     }
 }
 
-need gsettings
 need gnome-extensions
 need glib-compile-schemas
-
-# Disable the old copy before replacing files. Ignore "not installed" errors.
-gnome-extensions disable "$UUID" >/dev/null 2>&1 || true
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -36,71 +31,58 @@ if [[ -n "$SCRIPT_DIR" \
       && -f "$SCRIPT_DIR/extension.js" \
       && -f "$SCRIPT_DIR/metadata.json" \
       && -f "$SCRIPT_DIR/schemas/org.gnome.shell.extensions.smart-arrow-tiling.gschema.xml" ]]; then
-    cp "$SCRIPT_DIR/extension.js" "$TMP_DIR/extension.js"
+    for file in extension.js layout.js snapOverlay.js stylesheet.css; do
+        cp "$SCRIPT_DIR/$file" "$TMP_DIR/$file"
+    done
     cp "$SCRIPT_DIR/metadata.json" "$TMP_DIR/metadata.json"
     cp "$SCRIPT_DIR/schemas/org.gnome.shell.extensions.smart-arrow-tiling.gschema.xml" \
        "$TMP_DIR/schemas/org.gnome.shell.extensions.smart-arrow-tiling.gschema.xml"
 else
     need curl
-    curl -fsSL "$REPO_RAW/extension.js" -o "$TMP_DIR/extension.js"
+    for file in extension.js layout.js snapOverlay.js stylesheet.css; do
+        curl -fsSL "$REPO_RAW/$file" -o "$TMP_DIR/$file"
+    done
     curl -fsSL "$REPO_RAW/metadata.json" -o "$TMP_DIR/metadata.json"
     curl -fsSL \
         "$REPO_RAW/schemas/org.gnome.shell.extensions.smart-arrow-tiling.gschema.xml" \
         -o "$TMP_DIR/schemas/org.gnome.shell.extensions.smart-arrow-tiling.gschema.xml"
 fi
 
-# Clean install: do not leave old JS, old schemas, or compiled schema files behind.
+# Validate the staged schema before touching the working installation.
+glib-compile-schemas --strict "$TMP_DIR/schemas"
+gnome-extensions disable "$UUID" >/dev/null 2>&1 || true
+
+# Clean install: do not leave old JS or schemas behind.
 rm -rf "$EXT_DIR"
 mkdir -p "$EXT_DIR/schemas"
-cp "$TMP_DIR/extension.js" "$EXT_DIR/extension.js"
+for file in extension.js layout.js snapOverlay.js stylesheet.css; do
+    cp "$TMP_DIR/$file" "$EXT_DIR/$file"
+done
 cp "$TMP_DIR/metadata.json" "$EXT_DIR/metadata.json"
 cp "$TMP_DIR/schemas/org.gnome.shell.extensions.smart-arrow-tiling.gschema.xml" \
    "$EXT_DIR/schemas/org.gnome.shell.extensions.smart-arrow-tiling.gschema.xml"
 
-glib-compile-schemas --strict "$EXT_DIR/schemas"
+cp "$TMP_DIR/schemas/gschemas.compiled" "$EXT_DIR/schemas/gschemas.compiled"
 
-# ------------------------------------------------------------
-# Permanent key ownership
-# ------------------------------------------------------------
-# GNOME owns only Alt+Up / Alt+Down for maximize/minimize.
-# Remove GNOME's native Super+Arrow tiling so Smart Arrow is the
-# only owner of Super+Left/Right/Up/Down.
-gsettings set org.gnome.desktop.wm.keybindings maximize "['<Alt>Up']"
-gsettings set org.gnome.desktop.wm.keybindings minimize "['<Alt>Down']"
-gsettings set org.gnome.desktop.wm.keybindings unmaximize "@as []"
-gsettings set org.gnome.mutter.keybindings toggle-tiled-left "@as []"
-gsettings set org.gnome.mutter.keybindings toggle-tiled-right "@as []"
-
-# Clear old Smart Arrow settings from previous versions, including
-# the old saved/restore binding state, then force the clean defaults.
-GSETTINGS_SCHEMA_DIR="$EXT_DIR/schemas" \
-    gsettings reset-recursively "$SCHEMA" || true
-
-GSETTINGS_SCHEMA_DIR="$EXT_DIR/schemas" \
-    gsettings set "$SCHEMA" tile-left "['<Super>Left']"
-GSETTINGS_SCHEMA_DIR="$EXT_DIR/schemas" \
-    gsettings set "$SCHEMA" tile-right "['<Super>Right']"
-GSETTINGS_SCHEMA_DIR="$EXT_DIR/schemas" \
-    gsettings set "$SCHEMA" tile-up "['<Super>Up']"
-GSETTINGS_SCHEMA_DIR="$EXT_DIR/schemas" \
-    gsettings set "$SCHEMA" tile-down "['<Super>Down']"
+# Key ownership is temporary and managed by enable()/disable().
+# Preserve the user's extension settings during updates.
 
 say ""
 say "Smart Arrow Tiling installed cleanly."
 say ""
 say "GNOME:"
-say "  Alt+Up    -> maximize"
-say "  Alt+Down  -> minimize"
+say "  Existing maximize/minimize bindings are preserved where non-conflicting."
+say "  Conflicting Super+Arrow bindings are restored on disable."
 say ""
 say "Smart Arrow Tiling:"
 say "  Super+Left / Super+Right       -> horizontal smart tiling"
 say "  Super+Left/Right then Up/Down -> quarter movement"
 say "  Super+Left/Right twice         -> 1/3 + 2/3"
-say "  standalone Super+Up/Down       -> intentionally no action"
+say "  standalone Super+Up/Down       -> swap vertical slots"
 say ""
 
 if gnome-extensions enable "$UUID" >/dev/null 2>&1; then
-    say "Extension enabled."
+    say "Extension enabled. Log out and back in to load the updated JavaScript."
 else
     say "GNOME has not loaded the freshly installed extension yet."
     say "Log out and back in once, then run:"

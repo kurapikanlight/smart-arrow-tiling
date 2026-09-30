@@ -1,1190 +1,366 @@
+import Gio from 'gi://Gio';
+import St from 'gi://St';
+import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
-
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import {emptyState, transition, geometry, resize, removeWindow} from './layout.js';
+import {SnapOverlay} from './snapOverlay.js';
 
-const VERSION = '11.0-clean-core';
-
+const KEYS = ['LEFT', 'RIGHT', 'UP', 'DOWN'];
 const SEQUENCE_DELAY_MS = 320;
-const LIVE_RESIZE_INTERVAL_MS = 30;
-const GEOMETRY_RETRY_MS = 25;
-const GEOMETRY_RETRY_MAX = 20;
-
-const OUTER_GAP = 1;
-const INNER_GAP = 1;
-const EDGE_TOLERANCE = 36;
-const GEOMETRY_TOLERANCE = 5;
-const RESIZE_TOLERANCE = 2;
-const MIN_REGION_SIZE = 90;
-
-const KEYBINDINGS = [
-    'tile-left',
-    'tile-right',
-    'tile-up',
-    'tile-down',
-];
 
 export default class SmartArrowTilingExtension extends Extension {
     enable() {
-        console.log(`[Smart Arrow Tiling] ENABLE ${VERSION}`);
-
         this._settings = this.getSettings();
-        this._pendingHorizontal = null;
-        this._pendingHorizontalTimer = 0;
-        this._pendingRects = new Map();
-        this._geometryTimers = new Map();
+        this._groups = [];
+        this._windows = new Map();
+        this._signals = [];
+        this._bindings = [];
+        this._shortcuts = [];
+        this._edgeOverride = null;
+        this._pending = null;
+        this._keyTimer = 0;
+        this._dragTimer = 0;
         this._grab = null;
-        this._liveResizeTimer = 0;
-
-        const flags = Meta.KeyBindingFlags.IGNORE_AUTOREPEAT;
-        const mode = Shell.ActionMode.NORMAL;
-
-        Main.wm.addKeybinding(
-            'tile-left',
-            this._settings,
-            flags,
-            mode,
-            () => this._onHorizontal('left')
-        );
-
-        Main.wm.addKeybinding(
-            'tile-right',
-            this._settings,
-            flags,
-            mode,
-            () => this._onHorizontal('right')
-        );
-
-        // Super+Up / Super+Down are sequence keys only.
-        // Standalone maximize/minimize is intentionally left to GNOME,
-        // which install.sh configures as Alt+Up / Alt+Down.
-        Main.wm.addKeybinding(
-            'tile-up',
-            this._settings,
-            flags,
-            mode,
-            () => this._onVertical('top')
-        );
-
-        Main.wm.addKeybinding(
-            'tile-down',
-            this._settings,
-            flags,
-            mode,
-            () => this._onVertical('bottom')
-        );
-
-        this._grabBeginId = global.display.connect(
-            'grab-op-begin',
-            (_display, win) => this._onGrabBegin(win)
-        );
-
-        this._grabEndId = global.display.connect(
-            'grab-op-end',
-            (_display, win) => this._onGrabEnd(win)
-        );
-
-        console.log(`[Smart Arrow Tiling] READY ${VERSION}`);
+        this._overlay = new SnapOverlay();
+        try {
+            this._takeShortcuts();
+            for (const key of KEYS) {
+                const name = `tile-${key.toLowerCase()}`;
+                Main.wm.addKeybinding(name, this._settings, Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
+                    Shell.ActionMode.NORMAL, () => this._key(key));
+                this._bindings.push(name);
+            }
+            this._connect(global.display, 'grab-op-begin', (_, win, op) => this._grabBegin(win, op));
+            this._connect(global.display, 'grab-op-end', (_, win) => this._grabEnd(win));
+            this._connect(global.display, 'notify::focus-window', () => this._cancelKey());
+            this._connect(global.stage, 'captured-event', (_, event) => {
+                if (this._grab && event.type() === Clutter.EventType.KEY_PRESS &&
+                    event.get_key_symbol() === Clutter.KEY_Escape) {
+                    this._grab.cancelled = true;
+                    this._overlay.hide();
+                }
+                return Clutter.EVENT_PROPAGATE;
+            });
+            this._connect(global.display, 'workareas-changed', () => {
+                for (const group of this._groups) this._apply(group, this._grab?.win);
+            });
+            this._connect(Main.layoutManager, 'monitors-changed', () => this._resetGroups());
+            this._connect(global.workspace_manager, 'active-workspace-changed', () => {
+                this._cancelKey();
+                this._stopDrag();
+            });
+        } catch (error) {
+            this.disable();
+            throw error;
+        }
     }
 
     disable() {
-        this._cancelPendingHorizontal(false);
-        this._stopLiveResize();
-
-        for (const name of KEYBINDINGS) {
-            try {
-                Main.wm.removeKeybinding(name);
-            } catch (_) {
-            }
+        this._cancelKey();
+        this._stopDrag();
+        for (const name of this._bindings ?? []) Main.wm.removeKeybinding(name);
+        for (const [object, id] of this._signals ?? []) object.disconnect(id);
+        this._signals = [];
+        this._resetGroups();
+        this._overlay?.destroy();
+        this._overlay = null;
+        // Preserve edits made by the user or another extension while enabled.
+        for (const {settings, key, value, replacement} of this._shortcuts ?? []) {
+            if (JSON.stringify(settings.get_strv(key)) !== JSON.stringify(replacement)) continue;
+            if (value === null) settings.reset(key);
+            else settings.set_value(key, value);
         }
-
-        if (this._grabBeginId) {
-            try {
-                global.display.disconnect(this._grabBeginId);
-            } catch (_) {
+        this._shortcuts = [];
+        if (this._edgeOverride) {
+            const {settings, value} = this._edgeOverride;
+            if (!settings.get_boolean('edge-tiling')) {
+                if (value === null) settings.reset('edge-tiling');
+                else settings.set_value('edge-tiling', value);
             }
-            this._grabBeginId = 0;
+            this._edgeOverride = null;
         }
-
-        if (this._grabEndId) {
-            try {
-                global.display.disconnect(this._grabEndId);
-            } catch (_) {
-            }
-            this._grabEndId = 0;
-        }
-
-        for (const sourceId of this._geometryTimers?.values() ?? []) {
-            try {
-                GLib.Source.remove(sourceId);
-            } catch (_) {
-            }
-        }
-
-        this._geometryTimers?.clear();
-        this._pendingRects?.clear();
-
+        this._bindings = [];
         this._settings = null;
-        this._pendingHorizontal = null;
-        this._pendingRects = null;
-        this._geometryTimers = null;
-        this._grab = null;
-
-        console.log(`[Smart Arrow Tiling] DISABLE ${VERSION}`);
     }
 
-    // ---------------------------------------------------------
-    // Key handling
-    // ---------------------------------------------------------
+    _connect(object, name, callback) {
+        this._signals.push([object, object.connect(name, callback)]);
+    }
 
-    _onHorizontal(side) {
-        const win = this._focusedWindow();
-        if (!win)
-            return;
-
-        const pending = this._pendingHorizontal;
-
-        // Same key twice => 1/3 + 2/3 layout.
-        if (pending?.win === win && pending.side === side) {
-            this._cancelPendingHorizontal(false);
-            this._tileThird(win, side);
-            return;
+    _takeShortcuts() {
+        const native = new Gio.Settings({schema_id: 'org.gnome.mutter'});
+        if (native.get_boolean('edge-tiling')) {
+            this._edgeOverride = {settings: native, value: native.get_user_value('edge-tiling')};
+            if (!native.set_boolean('edge-tiling', false)) throw new Error('Cannot release native edge tiling');
         }
-
-        // Finish an unrelated pending horizontal action first.
-        if (pending) {
-            this._cancelPendingHorizontal(false);
-            this._executeHorizontal(pending);
-        }
-
-        const sourceRect = this._rect(win);
-        if (!sourceRect)
-            return;
-
-        this._pendingHorizontal = {
-            win,
-            side,
-            sourceRect: {...sourceRect},
-        };
-
-        this._pendingHorizontalTimer = GLib.timeout_add(
-            GLib.PRIORITY_DEFAULT,
-            SEQUENCE_DELAY_MS,
-            () => {
-                const action = this._pendingHorizontal;
-                this._pendingHorizontal = null;
-                this._pendingHorizontalTimer = 0;
-
-                if (action?.win)
-                    this._executeHorizontal(action);
-
-                return GLib.SOURCE_REMOVE;
+        for (const schema_id of ['org.gnome.desktop.wm.keybindings', 'org.gnome.mutter.keybindings', 'org.gnome.shell.keybindings']) {
+            const settings = new Gio.Settings({schema_id});
+            for (const key of settings.settings_schema.list_keys()) {
+                if (settings.get_value(key).get_type_string() !== 'as') continue;
+                const bindings = settings.get_strv(key);
+                const replacement = bindings.filter(accel => !/^<(super|mod4)>(left|right|up|down)$/i.test(accel));
+                if (replacement.length === bindings.length) continue;
+                const value = settings.get_user_value(key);
+                this._shortcuts.push({settings, key, value, replacement});
+                if (!settings.set_strv(key, replacement)) throw new Error(`Cannot release ${schema_id}:${key}`);
             }
-        );
-    }
-
-    _onVertical(vertical) {
-        const win = this._focusedWindow();
-        if (!win)
-            return;
-
-        const pending = this._pendingHorizontal;
-
-        // Vertical keys only complete a horizontal sequence.
-        // Standalone Super+Up / Super+Down intentionally do nothing.
-        if (pending?.win !== win) {
-            this._cancelPendingHorizontal(false);
-            return;
         }
-
-        this._cancelPendingHorizontal(false);
-        this._moveQuarterAtomic(
-            win,
-            pending.side,
-            vertical,
-            pending.sourceRect
-        );
     }
 
-    _cancelPendingHorizontal(execute = false) {
-        const pending = this._pendingHorizontal;
-
-        if (this._pendingHorizontalTimer) {
-            try {
-                GLib.Source.remove(this._pendingHorizontalTimer);
-            } catch (_) {
-            }
-            this._pendingHorizontalTimer = 0;
-        }
-
-        this._pendingHorizontal = null;
-
-        if (execute && pending?.win)
-            this._executeHorizontal(pending);
+    _supported(win) {
+        return win && win.get_window_type() === Meta.WindowType.NORMAL &&
+            !win.is_fullscreen() && !win.is_on_all_workspaces() && win.allows_move() && (win.is_maximized() || win.allows_resize());
     }
 
-    _executeHorizontal(action) {
-        const {win, side, sourceRect} = action;
-        if (!this._isSupportedWindow(win))
-            return;
-
-        const area = this._screenArea(win);
-        const current = this._effectiveRect(win);
-
-        if (!this._isLikelyTiled(current, area)) {
-            this._snapFloatingHalf(win, side, sourceRect);
-            return;
-        }
-
-        const sourceSide = this._side(current, area);
-
-        // Already in this column. Leave the current layout alone.
-        // A second same-side key is handled by _tileThird().
-        if (sourceSide === side)
-            return;
-
-        if (this._isFullHeight(current, area)) {
-            this._moveFullColumn(win, side, current);
-            return;
-        }
-
-        this._moveQuarterAtomic(
-            win,
-            side,
-            this._verticalSlot(current, area),
-            current
-        );
-    }
-
-    // ---------------------------------------------------------
-    // Window / workspace helpers
-    // ---------------------------------------------------------
-
-    _isSupportedWindow(win) {
-        if (!win || win.is_fullscreen())
-            return false;
-
-        const type = win.get_window_type();
-        return [
-            Meta.WindowType.NORMAL,
-            Meta.WindowType.DIALOG,
-            Meta.WindowType.MODAL_DIALOG,
-        ].includes(type);
-    }
-
-    _focusedWindow() {
+    _key(key) {
         const win = global.display.get_focus_window();
-        return this._isSupportedWindow(win) ? win : null;
-    }
-
-    _screenArea(win) {
-        return global.display.get_monitor_geometry(win.get_monitor());
-    }
-
-    _bounds(area) {
-        return {
-            left: area.x + OUTER_GAP,
-            top: area.y + OUTER_GAP,
-            right: area.x + area.width - OUTER_GAP,
-            bottom: area.y + area.height - OUTER_GAP,
-        };
-    }
-
-    _rect(win) {
-        try {
-            return {...win.get_frame_rect()};
-        } catch (_) {
-            return null;
-        }
-    }
-
-    _effectiveRect(win) {
-        return this._pendingRects?.get(win.get_id()) ?? this._rect(win);
-    }
-
-    _entries(win, area) {
-        const workspace = win.get_workspace();
-        const monitor = win.get_monitor();
-        const result = [];
-
-        for (const peer of workspace.list_windows()) {
-            if (
-                peer === win ||
-                peer.get_monitor() !== monitor ||
-                peer.is_hidden() ||
-                !this._isSupportedWindow(peer)
-            ) {
-                continue;
-            }
-
-            const rect = this._effectiveRect(peer);
-            if (!rect || !this._isLikelyTiled(rect, area))
-                continue;
-
-            result.push(this._entry(peer, rect, area));
-        }
-
-        return result;
-    }
-
-    _entry(win, rect, area) {
-        return {
-            win,
-            rect: {...rect},
-            side: this._side(rect, area),
-            vertical: this._verticalSlot(rect, area),
-            fullHeight: this._isFullHeight(rect, area),
-        };
-    }
-
-    _entriesOnSide(entries, side) {
-        return entries
-            .filter(entry => entry.side === side)
-            .sort((a, b) => a.rect.y - b.rect.y);
-    }
-
-    _oppositeSide(side) {
-        return side === 'left' ? 'right' : 'left';
-    }
-
-    _oppositeVertical(vertical) {
-        return vertical === 'top' ? 'bottom' : 'top';
-    }
-
-    // ---------------------------------------------------------
-    // Geometry classification
-    // ---------------------------------------------------------
-
-    _side(rect, area) {
-        const center = rect.x + rect.width / 2;
-        return center < area.x + area.width / 2 ? 'left' : 'right';
-    }
-
-    _verticalSlot(rect, area) {
-        const center = rect.y + rect.height / 2;
-        return center < area.y + area.height / 2 ? 'top' : 'bottom';
-    }
-
-    _isFullHeight(rect, area) {
-        const b = this._bounds(area);
-        return (
-            Math.abs(rect.y - b.top) <= EDGE_TOLERANCE &&
-            Math.abs(rect.y + rect.height - b.bottom) <= EDGE_TOLERANCE
-        );
-    }
-
-    _isLikelyTiled(rect, area) {
-        if (!rect)
-            return false;
-
-        const b = this._bounds(area);
-        const touchesSide =
-            Math.abs(rect.x - b.left) <= EDGE_TOLERANCE ||
-            Math.abs(rect.x + rect.width - b.right) <= EDGE_TOLERANCE;
-
-        const touchesVerticalEdge =
-            Math.abs(rect.y - b.top) <= EDGE_TOLERANCE ||
-            Math.abs(rect.y + rect.height - b.bottom) <= EDGE_TOLERANCE;
-
-        return (
-            touchesSide &&
-            touchesVerticalEdge &&
-            rect.width >= MIN_REGION_SIZE &&
-            rect.height >= MIN_REGION_SIZE
-        );
-    }
-
-    // ---------------------------------------------------------
-    // Canonical regions
-    // ---------------------------------------------------------
-
-    _halves(area) {
-        const b = this._bounds(area);
-        const usable = Math.max(2, b.right - b.left - INNER_GAP);
-        const leftWidth = Math.floor(usable / 2);
-        const rightWidth = usable - leftWidth;
-        const height = Math.max(1, b.bottom - b.top);
-
-        return {
-            left: {
-                x: b.left,
-                y: b.top,
-                width: leftWidth,
-                height,
-            },
-            right: {
-                x: b.left + leftWidth + INNER_GAP,
-                y: b.top,
-                width: rightWidth,
-                height,
-            },
-        };
-    }
-
-    _quarter(area, side, vertical) {
-        const half = this._halves(area)[side];
-        const split = this._splitVerticalRegion(half, 0.5);
-        return split[vertical];
-    }
-
-    _thirdPair(area, side) {
-        const b = this._bounds(area);
-        const width = Math.max(3, b.right - b.left - INNER_GAP);
-        const oneThird = Math.round(width / 3);
-        const twoThird = width - oneThird;
-        const height = Math.max(1, b.bottom - b.top);
-
-        if (side === 'left') {
-            return {
-                current: {
-                    x: b.left,
-                    y: b.top,
-                    width: oneThird,
-                    height,
-                },
-                complement: {
-                    x: b.left + oneThird + INNER_GAP,
-                    y: b.top,
-                    width: twoThird,
-                    height,
-                },
-            };
-        }
-
-        return {
-            complement: {
-                x: b.left,
-                y: b.top,
-                width: twoThird,
-                height,
-            },
-            current: {
-                x: b.left + twoThird + INNER_GAP,
-                y: b.top,
-                width: oneThird,
-                height,
-            },
-        };
-    }
-
-    _columnRegionFromRect(rect, area) {
-        const b = this._bounds(area);
-        const x = Math.max(b.left, Math.round(rect.x));
-        const right = Math.min(b.right, Math.round(rect.x + rect.width));
-
-        return {
-            x,
-            y: b.top,
-            width: Math.max(MIN_REGION_SIZE, right - x),
-            height: Math.max(MIN_REGION_SIZE, b.bottom - b.top),
-        };
-    }
-
-    _columnRegionFromEntries(entries, side, area) {
-        if (!entries.length)
-            return this._halves(area)[side];
-
-        let left = Infinity;
-        let right = -Infinity;
-
-        for (const entry of entries) {
-            left = Math.min(left, entry.rect.x);
-            right = Math.max(right, entry.rect.x + entry.rect.width);
-        }
-
-        const b = this._bounds(area);
-        left = Math.max(b.left, Math.round(left));
-        right = Math.min(b.right, Math.round(right));
-
-        if (right - left < MIN_REGION_SIZE)
-            return this._halves(area)[side];
-
-        return {
-            x: left,
-            y: b.top,
-            width: right - left,
-            height: b.bottom - b.top,
-        };
-    }
-
-    _splitVerticalRegion(region, ratio = 0.5) {
-        const usable = Math.max(2, region.height - INNER_GAP);
-        const minRatio = MIN_REGION_SIZE / usable;
-        const clampedRatio = Math.max(
-            minRatio,
-            Math.min(1 - minRatio, ratio)
-        );
-
-        const topHeight = Math.max(
-            MIN_REGION_SIZE,
-            Math.min(
-                usable - MIN_REGION_SIZE,
-                Math.round(usable * clampedRatio)
-            )
-        );
-
-        const bottomHeight = usable - topHeight;
-
-        return {
-            top: {
-                x: region.x,
-                y: region.y,
-                width: region.width,
-                height: topHeight,
-            },
-            bottom: {
-                x: region.x,
-                y: region.y + topHeight + INNER_GAP,
-                width: region.width,
-                height: bottomHeight,
-            },
-        };
-    }
-
-    _missingVerticalRegion(existing, wanted, columnRegion) {
-        if (existing.vertical === wanted)
-            return {...existing.rect};
-
-        const btm = columnRegion.y + columnRegion.height;
-
-        if (wanted === 'top') {
-            const height = existing.rect.y - INNER_GAP - columnRegion.y;
-            if (height >= MIN_REGION_SIZE) {
-                return {
-                    x: columnRegion.x,
-                    y: columnRegion.y,
-                    width: columnRegion.width,
-                    height,
-                };
-            }
-        } else {
-            const y = existing.rect.y + existing.rect.height + INNER_GAP;
-            const height = btm - y;
-            if (height >= MIN_REGION_SIZE) {
-                return {
-                    x: columnRegion.x,
-                    y,
-                    width: columnRegion.width,
-                    height,
-                };
-            }
-        }
-
-        return this._splitVerticalRegion(columnRegion, 0.5)[wanted];
-    }
-
-    _verticalRatio(rect, columnRegion, vertical) {
-        if (!rect || !columnRegion)
-            return 0.5;
-
-        const usable = Math.max(1, columnRegion.height - INNER_GAP);
-
-        if (vertical === 'top')
-            return Math.max(0.2, Math.min(0.8, rect.height / usable));
-
-        return Math.max(
-            0.2,
-            Math.min(0.8, 1 - rect.height / usable)
-        );
-    }
-
-    // ---------------------------------------------------------
-    // Plan helpers
-    // ---------------------------------------------------------
-
-    _pushMove(plan, win, rect) {
-        if (!win || !rect)
+        if (!this._supported(win) || this._grab) return;
+        const pending = this._pending;
+        this._cancelKey();
+        const group = this._groups.find(g => g.workspace === win.get_workspace() && g.monitor === win.get_monitor());
+        const sequence = pending?.win === win && pending.group === group && group.state === pending.after;
+        if (key === 'UP' || key === 'DOWN') {
+            this._command(win, sequence ? `${key}_${pending.key}` : key,
+                null, win.get_monitor(), sequence ? pending.before : null);
             return;
-
-        if (rect.width < 1 || rect.height < 1)
+        }
+        if (sequence && pending.key === key) {
+            this._command(win, `THIRD_${key}`, null, win.get_monitor(), pending.before);
             return;
-
-        plan.set(win.get_id(), {
-            win,
-            rect: {
-                x: Math.round(rect.x),
-                y: Math.round(rect.y),
-                width: Math.round(rect.width),
-                height: Math.round(rect.height),
-            },
+        }
+        const before = group?.state ?? emptyState();
+        this._command(win, key);
+        const current = this._windows.get(win)?.group;
+        if (!current) return;
+        // Act immediately; a second key refines the same logical starting state.
+        this._pending = {win, key, group: current, before, after: current.state};
+        this._keyTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SEQUENCE_DELAY_MS, () => {
+            this._keyTimer = 0;
+            this._pending = null;
+            return GLib.SOURCE_REMOVE;
         });
     }
 
-    _fitVertical(plan, entries, region) {
-        if (!entries.length)
-            return;
+    _cancelKey() {
+        if (this._keyTimer) GLib.Source.remove(this._keyTimer);
+        this._keyTimer = 0;
+        this._pending = null;
+    }
 
-        if (entries.length === 1) {
-            this._pushMove(plan, entries[0].win, region);
+    _group(workspace, monitor) {
+        let group = this._groups.find(g => g.workspace === workspace && g.monitor === monitor);
+        if (!group) {
+            group = {workspace, monitor, state: emptyState()};
+            this._groups.push(group);
+        }
+        return group;
+    }
+
+    _command(win, command, layout = null, monitor = win.get_monitor(), baseState = null) {
+        if (!this._supported(win)) return;
+        const group = this._group(win.get_workspace(), monitor);
+        const next = transition(baseState ?? group.state, win.get_id(), command, layout);
+        if (baseState && next === baseState) return; // Unsupported refinement keeps the first move.
+        if (!Object.values(next.slots).includes(win.get_id())) {
+            if (Object.values(group.state.slots).every(id => id === null))
+                this._groups = this._groups.filter(g => g !== group);
             return;
         }
-
-        if (entries.length !== 2)
-            return;
-
-        const sorted = [...entries].sort((a, b) => a.rect.y - b.rect.y);
-        const total = Math.max(2, sorted[0].rect.height + sorted[1].rect.height);
-        const ratio = sorted[0].rect.height / total;
-        const split = this._splitVerticalRegion(region, ratio);
-
-        this._pushMove(plan, sorted[0].win, split.top);
-        this._pushMove(plan, sorted[1].win, split.bottom);
-    }
-
-    _fillVacatedColumn(plan, sourceEntries, sourceRect, area) {
-        if (!sourceEntries.length)
-            return;
-
-        if (sourceEntries.length > 2)
-            return;
-
-        const region = this._columnRegionFromRect(sourceRect, area);
-        this._fitVertical(plan, sourceEntries, region);
-    }
-
-    _executePlan(plan, label) {
-        if (!(plan instanceof Map) || !plan.size)
-            return;
-
-        console.log(
-            `[Smart Arrow Tiling] ${label}: ${plan.size} window(s)`
-        );
-
-        for (const {win, rect} of plan.values())
-            this._requestGeometry(win, rect);
-    }
-
-    // ---------------------------------------------------------
-    // Horizontal actions
-    // ---------------------------------------------------------
-
-    _snapFloatingHalf(win, side, sourceRect) {
-        const area = this._screenArea(win);
-        const peers = this._entries(win, area);
-        const target = this._entriesOnSide(peers, side);
-        const opposite = this._entriesOnSide(peers, this._oppositeSide(side));
-        const plan = new Map();
-
-        if (!target.length) {
-            this._pushMove(plan, win, this._halves(area)[side]);
-            this._executePlan(plan, `floating-half-${side}`);
-            return;
+        const record = this._windows.get(win);
+        if (record && record.group !== group) this._detach(win);
+        // Commit every slot before issuing even the first native move.
+        group.state = next;
+        if (!this._groups.includes(group)) this._groups.push(group);
+        if (!this._windows.has(win)) this._track(win, group);
+        this._windows.get(win).configured = null; // Explicit commands also repair client geometry drift.
+        if (win.get_monitor() !== monitor) {
+            this._windows.get(win).applying = true;
+            win.move_to_monitor(monitor);
+            this._windows.get(win).applying = false;
         }
+        this._apply(group);
+    }
 
-        // If the opposite column is empty, shift the target group there.
-        if (!opposite.length && target.length <= 2) {
-            this._fitVertical(
-                plan,
-                target,
-                this._halves(area)[this._oppositeSide(side)]
-            );
-            this._pushMove(plan, win, this._halves(area)[side]);
-            this._executePlan(plan, `floating-half-insert-${side}`);
-            return;
-        }
+    _track(win, group) {
+        const record = {group, signals: [], idle: 0, applying: false, target: null, configured: null, animation: null};
+        this._windows.set(win, record);
+        const connect = (signal, fn) => record.signals.push(win.connect(signal, fn));
+        connect('unmanaged', () => this._detach(win));
+        connect('workspace-changed', () => this._validate(win));
+        for (const prop of ['minimized', 'maximized-horizontally', 'maximized-vertically', 'fullscreen', 'on-all-workspaces', 'main-monitor'])
+            connect(`notify::${prop}`, () => this._validate(win));
+        connect('size-changed', () => {
+            if (this._grab?.win !== win || this._grab.moving || record.applying) return;
+            group.state = resize(group.state, win.get_id(), win.get_frame_rect(), this._area(group));
+            this._apply(group, win);
+        });
+    }
 
-        // With one target window, use the old floating rect as its destination.
-        // This avoids overlap without trying to squeeze five windows into a grid.
-        if (target.length === 1) {
-            this._pushMove(plan, target[0].win, sourceRect);
-            this._pushMove(plan, win, this._columnRegionFromEntries(target, side, area));
-            this._executePlan(plan, `floating-half-replace-${side}`);
+    _validate(win) {
+        const r = this._windows.get(win);
+        if (!r || r.applying || this._grab?.win === win) return;
+        if (!this._supported(win) || win.minimized || win.is_maximized() ||
+            win.get_monitor() !== r.group.monitor || win.get_workspace() !== r.group.workspace)
+            this._detach(win);
+    }
+
+    _detach(win, reflow = true) {
+        const r = this._windows.get(win);
+        if (!r) return;
+        if (this._pending?.win === win) this._cancelKey();
+        if (this._grab?.win === win) this._stopDrag(false);
+        this._clearAnimation(r);
+        this._windows.delete(win);
+        if (r.idle) GLib.Source.remove(r.idle);
+        for (const id of r.signals) win.disconnect(id);
+        r.group.state = removeWindow(r.group.state, win.get_id());
+        if (Object.values(r.group.state.slots).every(id => id === null))
+            this._groups = this._groups.filter(g => g !== r.group);
+        else if (reflow) this._apply(r.group);
+    }
+
+    _area(group) {
+        return group.workspace.get_work_area_for_monitor(group.monitor);
+    }
+
+    _apply(group, skip = null) {
+        const rectangles = geometry(group.state, this._area(group));
+        for (const [win, record] of this._windows) {
+            if (record.group !== group || win === skip) continue;
+            const slot = Object.keys(group.state.slots).find(k => group.state.slots[k] === win.get_id());
+            if (!slot) continue;
+            const target = rectangles[slot];
+            const equal = (a, b) => a && b && ['x', 'y', 'width', 'height'].every(k => a[k] === b[k]);
+            record.target = target;
+            record.animate = !this._grab && !win.is_maximized() && (!record.idle || record.animate);
+            if (record.idle) continue; // Keep one pending write, using the latest target.
+            if (equal(record.configured, target) && !win.is_maximized()) continue;
+            record.applying = true;
+            try { if (win.is_maximized()) win.unmaximize(); }
+            finally { record.applying = false; }
+            record.idle = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                record.idle = 0;
+                if (!this._windows.has(win)) return GLib.SOURCE_REMOVE;
+                const r = record.target;
+                if (equal(record.configured, r)) return GLib.SOURCE_REMOVE;
+                record.applying = true;
+                try {
+                    this._animateMove(win, record, r);
+                    win.move_resize_frame(true, r.x, r.y, r.width, r.height);
+                    record.configured = r;
+                } catch (error) { console.error(`[Smart Arrow Tiling] ${error}`); }
+                finally { record.applying = false; }
+                return GLib.SOURCE_REMOVE;
+            });
         }
     }
 
-    _moveFullColumn(win, targetSide, sourceRect) {
-        const area = this._screenArea(win);
-        const peers = this._entries(win, area);
-        const target = this._entriesOnSide(peers, targetSide);
-        const plan = new Map();
-
-        if (!target.length) {
-            this._pushMove(plan, win, this._halves(area)[targetSide]);
-            this._executePlan(plan, `full-column-${targetSide}`);
-            return;
-        }
-
-        if (target.length > 2)
-            return;
-
-        const targetRegion = this._columnRegionFromEntries(target, targetSide, area);
-        const sourceRegion = this._columnRegionFromRect(sourceRect, area);
-
-        this._fitVertical(plan, target, sourceRegion);
-        this._pushMove(plan, win, targetRegion);
-        this._executePlan(plan, `full-column-swap-${targetSide}`);
+    _clearAnimation(record) {
+        const snapshot = record.animation;
+        record.animation = null;
+        snapshot?.destroy();
     }
 
-    _tileThird(win, side) {
-        const area = this._screenArea(win);
-        const peers = this._entries(win, area);
-
-        // A 4-window grid has three peers. Do not collapse it into an
-        // ambiguous 1/3 layout.
-        if (peers.length > 2)
-            return;
-
-        const pair = this._thirdPair(area, side);
-        const plan = new Map();
-
-        this._pushMove(plan, win, pair.current);
-        this._fitVertical(plan, peers, pair.complement);
-        this._executePlan(plan, `third-${side}`);
-    }
-
-    // ---------------------------------------------------------
-    // Atomic quarter movement / swapping
-    // ---------------------------------------------------------
-
-    _moveQuarterAtomic(win, targetSide, targetVertical, sourceRect) {
-        const area = this._screenArea(win);
-        const sourceTiled = this._isLikelyTiled(sourceRect, area);
-        const sourceSide = sourceTiled ? this._side(sourceRect, area) : null;
-        const sourceFull = sourceTiled ? this._isFullHeight(sourceRect, area) : false;
-        const sourceVertical = sourceTiled && !sourceFull
-            ? this._verticalSlot(sourceRect, area)
-            : null;
-
-        const peers = this._entries(win, area);
-        const target = this._entriesOnSide(peers, targetSide);
-        const sourcePeers = sourceSide
-            ? this._entriesOnSide(peers, sourceSide)
-            : [];
-
-        const plan = new Map();
-
-        // Do not turn the only full-height window in a column into a lone
-        // quarter. That creates the exact black hole this extension avoids.
-        if (sourceTiled && sourceSide === targetSide && sourceFull)
-            return;
-
-        // Same-column stack movement is a literal top/bottom swap.
-        if (sourceTiled && sourceSide === targetSide && !sourceFull) {
-            if (sourceVertical === targetVertical)
-                return;
-
-            const sibling = target.find(
-                entry => !entry.fullHeight && entry.vertical === targetVertical
-            );
-
-            if (!sibling)
-                return;
-
-            this._pushMove(plan, win, sibling.rect);
-            this._pushMove(plan, sibling.win, sourceRect);
-            this._executePlan(plan, `same-column-${targetVertical}-swap`);
-            return;
-        }
-
-        if (target.length > 2)
-            return;
-
-        // Exact target slot: literal swap. This is the A <-> D case.
-        if (target.length === 2) {
-            const victim = target.find(
-                entry => !entry.fullHeight && entry.vertical === targetVertical
-            );
-
-            if (!victim)
-                return;
-
-            this._pushMove(plan, win, victim.rect);
-
-            if (sourceTiled) {
-                this._pushMove(plan, victim.win, sourceRect);
-            } else {
-                this._pushMove(plan, victim.win, sourceRect);
-            }
-
-            this._executePlan(plan, `quarter-slot-swap-${targetSide}-${targetVertical}`);
-            return;
-        }
-
-        if (target.length === 1) {
-            const only = target[0];
-            const columnRegion = this._columnRegionFromEntries(target, targetSide, area);
-
-            // Full-height destination: split it into two slots. The existing
-            // window occupies the opposite slot and the source column heals.
-            if (only.fullHeight) {
-                const ratio = sourceTiled && !sourceFull
-                    ? this._verticalRatio(sourceRect, this._columnRegionFromRect(sourceRect, area), targetVertical)
-                    : 0.5;
-
-                const split = this._splitVerticalRegion(columnRegion, ratio);
-                this._pushMove(plan, win, split[targetVertical]);
-                this._pushMove(plan, only.win, split[this._oppositeVertical(targetVertical)]);
-
-                if (sourceTiled && sourceSide !== targetSide)
-                    this._fillVacatedColumn(plan, sourcePeers, sourceRect, area);
-
-                this._executePlan(plan, `quarter-split-full-${targetSide}-${targetVertical}`);
-                return;
-            }
-
-            // The only window already occupies the requested slot => swap.
-            if (only.vertical === targetVertical) {
-                this._pushMove(plan, win, only.rect);
-                this._pushMove(plan, only.win, sourceRect);
-                this._executePlan(plan, `quarter-single-swap-${targetSide}-${targetVertical}`);
-                return;
-            }
-
-            // The opposite slot exists and the requested slot is empty.
-            const desired = this._missingVerticalRegion(
-                only,
-                targetVertical,
-                columnRegion
-            );
-
-            this._pushMove(plan, win, desired);
-
-            if (sourceTiled && sourceSide !== targetSide)
-                this._fillVacatedColumn(plan, sourcePeers, sourceRect, area);
-
-            this._executePlan(plan, `quarter-fill-empty-${targetSide}-${targetVertical}`);
-            return;
-        }
-
-        // Empty destination column.
-        this._pushMove(plan, win, this._quarter(area, targetSide, targetVertical));
-
-        if (sourceTiled && sourceSide !== targetSide)
-            this._fillVacatedColumn(plan, sourcePeers, sourceRect, area);
-
-        this._executePlan(plan, `quarter-empty-${targetSide}-${targetVertical}`);
-    }
-
-    // ---------------------------------------------------------
-    // Manual resize: linked dividers
-    // ---------------------------------------------------------
-
-    _onGrabBegin(win) {
-        if (!this._isSupportedWindow(win))
-            return;
-
-        const rect = this._rect(win);
-        if (!rect)
-            return;
-
-        const area = this._screenArea(win);
-        if (!this._isLikelyTiled(rect, area))
-            return;
-
-        this._cancelMonitorGeometryJobs(win);
-        this._stopLiveResize();
-
-        this._grab = {
-            win,
-            start: {...rect},
-            last: {...rect},
-        };
-
-        this._liveResizeTimer = GLib.timeout_add(
-            GLib.PRIORITY_DEFAULT,
-            LIVE_RESIZE_INTERVAL_MS,
-            () => {
-                if (!this._grab?.win)
-                    return GLib.SOURCE_REMOVE;
-
-                const current = this._rect(this._grab.win);
-                if (!current)
-                    return GLib.SOURCE_CONTINUE;
-
-                this._reflowManualResize(
-                    this._grab.win,
-                    this._grab.last,
-                    current
-                );
-
-                this._grab.last = {...current};
-                return GLib.SOURCE_CONTINUE;
-            }
-        );
-    }
-
-    _onGrabEnd(win) {
-        if (!this._grab || this._grab.win !== win)
-            return;
-
-        const last = this._grab.last;
-        const current = this._rect(win);
-
-        if (current)
-            this._reflowManualResize(win, last, current);
-
-        this._stopLiveResize();
-        this._grab = null;
-    }
-
-    _stopLiveResize() {
-        if (!this._liveResizeTimer)
-            return;
-
+    _animateMove(win, record, target) {
+        this._clearAnimation(record);
+        if (!record.animate || !St.Settings.get().enable_animations) return;
+        // Animate an owned snapshot, never the compositor's live actor or its
+        // transforms. Native geometry is submitted once, without waiting for this.
+        const actor = win.get_compositor_private();
+        const rect = win.get_frame_rect();
+        if (!actor || rect.width <= 0 || rect.height <= 0 ||
+            ['x', 'y', 'width', 'height'].every(k => rect[k] === target[k])) return;
         try {
-            GLib.Source.remove(this._liveResizeTimer);
-        } catch (_) {
+            const snapshot = new St.Widget({content: actor.paint_to_content(rect), reactive: false});
+            record.animation = snapshot;
+            snapshot.set_position(rect.x, rect.y);
+            snapshot.set_size(rect.width, rect.height);
+            Main.uiGroup.add_child(snapshot);
+            snapshot.ease({...target, opacity: 0, duration: 120,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                onStopped: () => {
+                    if (record.animation === snapshot) this._clearAnimation(record);
+                }});
+        } catch (error) {
+            this._clearAnimation(record);
+            console.error(`[Smart Arrow Tiling] Animation: ${error}`);
         }
-
-        this._liveResizeTimer = 0;
     }
 
-    _reflowManualResize(win, before, current) {
-        if (!before || !current)
-            return;
-
-        const widthChanged = Math.abs(current.width - before.width) >= RESIZE_TOLERANCE;
-        const heightChanged = Math.abs(current.height - before.height) >= RESIZE_TOLERANCE;
-
-        if (!widthChanged && !heightChanged)
-            return;
-
-        const area = this._screenArea(win);
-        if (!this._isLikelyTiled(current, area))
-            return;
-
-        const b = this._bounds(area);
-        const side = this._side(current, area);
-        const vertical = this._verticalSlot(current, area);
-        const fullHeight = this._isFullHeight(current, area);
-        const peers = this._entries(win, area);
-        const same = this._entriesOnSide(peers, side);
-        const opposite = this._entriesOnSide(peers, this._oppositeSide(side));
-        const plan = new Map();
-
-        let currentColumn = this._columnRegionFromRect(current, area);
-
-        if (widthChanged) {
-            let boundary;
-            let leftRegion;
-            let rightRegion;
-
-            if (side === 'left') {
-                boundary = Math.max(
-                    b.left + MIN_REGION_SIZE,
-                    Math.min(
-                        b.right - INNER_GAP - MIN_REGION_SIZE,
-                        current.x + current.width
-                    )
-                );
-
-                leftRegion = {
-                    x: b.left,
-                    y: b.top,
-                    width: boundary - b.left,
-                    height: b.bottom - b.top,
-                };
-                rightRegion = {
-                    x: boundary + INNER_GAP,
-                    y: b.top,
-                    width: b.right - boundary - INNER_GAP,
-                    height: b.bottom - b.top,
-                };
-            } else {
-                boundary = Math.max(
-                    b.left + MIN_REGION_SIZE + INNER_GAP,
-                    Math.min(
-                        b.right - MIN_REGION_SIZE,
-                        current.x
-                    )
-                );
-
-                leftRegion = {
-                    x: b.left,
-                    y: b.top,
-                    width: boundary - INNER_GAP - b.left,
-                    height: b.bottom - b.top,
-                };
-                rightRegion = {
-                    x: boundary,
-                    y: b.top,
-                    width: b.right - boundary,
-                    height: b.bottom - b.top,
-                };
-            }
-
-            currentColumn = side === 'left' ? leftRegion : rightRegion;
-            const otherColumn = side === 'left' ? rightRegion : leftRegion;
-
-            // Windows stacked with the one being resized inherit its x/width,
-            // while their vertical divider remains where the user left it.
-            for (const entry of same) {
-                this._pushMove(plan, entry.win, {
-                    x: currentColumn.x,
-                    y: entry.rect.y,
-                    width: currentColumn.width,
-                    height: entry.rect.height,
-                });
-            }
-
-            // The opposite column consumes every remaining horizontal pixel.
-            this._fitVertical(plan, opposite, otherColumn);
-        }
-
-        if (heightChanged && !fullHeight) {
-            const sibling = same.find(
-                entry => !entry.fullHeight && entry.vertical !== vertical
-            );
-
-            if (sibling) {
-                if (vertical === 'top') {
-                    const y = current.y + current.height + INNER_GAP;
-                    const height = b.bottom - y;
-
-                    if (height >= MIN_REGION_SIZE) {
-                        this._pushMove(plan, sibling.win, {
-                            x: currentColumn.x,
-                            y,
-                            width: currentColumn.width,
-                            height,
-                        });
-                    }
-                } else {
-                    const height = current.y - INNER_GAP - b.top;
-
-                    if (height >= MIN_REGION_SIZE) {
-                        this._pushMove(plan, sibling.win, {
-                            x: currentColumn.x,
-                            y: b.top,
-                            width: currentColumn.width,
-                            height,
-                        });
-                    }
-                }
-            }
-        }
-
-        this._executePlan(plan, `manual-resize-${side}`);
+    _resetGroups() {
+        this._cancelKey();
+        this._stopDrag();
+        for (const win of this._windows?.keys() ?? []) this._detach(win, false);
+        this._groups = [];
     }
 
-    // ---------------------------------------------------------
-    // Geometry engine
-    // ---------------------------------------------------------
-
-    _matches(actual, target) {
-        return (
-            Math.abs(actual.x - target.x) <= GEOMETRY_TOLERANCE &&
-            Math.abs(actual.y - target.y) <= GEOMETRY_TOLERANCE &&
-            Math.abs(actual.width - target.width) <= GEOMETRY_TOLERANCE &&
-            Math.abs(actual.height - target.height) <= GEOMETRY_TOLERANCE
-        );
-    }
-
-    _requestGeometry(win, rect) {
-        if (!this._isSupportedWindow(win))
-            return;
-
-        const id = win.get_id();
-        const target = {
-            x: Math.round(rect.x),
-            y: Math.round(rect.y),
-            width: Math.max(1, Math.round(rect.width)),
-            height: Math.max(1, Math.round(rect.height)),
-        };
-
-        this._cancelGeometryJob(win);
-        this._pendingRects.set(id, target);
-
-        try {
-            if (win.is_maximized())
-                win.unmaximize();
-        } catch (_) {
+    _grabBegin(win, op) {
+        this._cancelKey();
+        this._stopDrag();
+        if (!this._supported(win)) return;
+        op &= ~Meta.GrabOp.WINDOW_FLAG_UNCONSTRAINED;
+        const moving = op === Meta.GrabOp.MOVING || op === Meta.GrabOp.KEYBOARD_MOVING;
+        const resizing = Object.keys(Meta.GrabOp).some(k => k.includes('RESIZING') && Meta.GrabOp[k] === op);
+        if (!moving && !resizing) return;
+        this._grab = {win, moving, drop: null, empty: emptyState(),
+            unmanaged: win.connect('unmanaged', () => this._stopDrag(false))};
+        const record = this._windows.get(win);
+        if (record?.idle) { GLib.Source.remove(record.idle); record.idle = 0; }
+        if (record) {
+            record.configured = null;
+            this._clearAnimation(record);
         }
-
-        let attempts = 0;
-
-        const apply = () => {
-            if (!this._isSupportedWindow(win)) {
-                this._pendingRects.delete(id);
-                this._geometryTimers.delete(id);
-                return GLib.SOURCE_REMOVE;
-            }
-
-            try {
-                win.move_resize_frame(
-                    true,
-                    target.x,
-                    target.y,
-                    target.width,
-                    target.height
-                );
-            } catch (error) {
-                console.error(`[Smart Arrow Tiling] move_resize_frame failed: ${error}`);
-                this._pendingRects.delete(id);
-                this._geometryTimers.delete(id);
-                return GLib.SOURCE_REMOVE;
-            }
-
-            attempts += 1;
-            const actual = this._rect(win);
-
-            if (actual && this._matches(actual, target)) {
-                this._pendingRects.delete(id);
-                this._geometryTimers.delete(id);
-                return GLib.SOURCE_REMOVE;
-            }
-
-            if (attempts >= GEOMETRY_RETRY_MAX) {
-                this._pendingRects.delete(id);
-                this._geometryTimers.delete(id);
-                return GLib.SOURCE_REMOVE;
-            }
-
+        if (!moving) return;
+        this._updateDrag();
+        this._dragTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 30, () => {
+            this._updateDrag();
             return GLib.SOURCE_CONTINUE;
-        };
-
-        // Apply immediately, then retry briefly because unmaximize and some
-        // Wayland clients may settle asynchronously.
-        try {
-            win.move_resize_frame(
-                true,
-                target.x,
-                target.y,
-                target.width,
-                target.height
-            );
-        } catch (_) {
-        }
-
-        const sourceId = GLib.timeout_add(
-            GLib.PRIORITY_DEFAULT,
-            GEOMETRY_RETRY_MS,
-            apply
-        );
-
-        this._geometryTimers.set(id, sourceId);
+        });
     }
 
-    _cancelMonitorGeometryJobs(win) {
-        const workspace = win?.get_workspace?.();
-        const monitor = win?.get_monitor?.();
-
-        if (!workspace || monitor === undefined)
-            return;
-
-        for (const peer of workspace.list_windows()) {
-            if (peer.get_monitor() === monitor)
-                this._cancelGeometryJob(peer);
-        }
+    _updateDrag() {
+        if (!this._grab?.moving || this._grab.cancelled) return;
+        const [x, y] = global.get_pointer();
+        const monitor = Main.layoutManager.monitors.findIndex(m => x >= m.x && y >= m.y && x < m.x + m.width && y < m.y + m.height);
+        if (monitor < 0) { this._overlay.hide(); this._grab.drop = null; return; }
+        const group = this._groups.find(g => g.workspace === this._grab.win.get_workspace() && g.monitor === monitor);
+        const state = group?.state ?? this._grab.empty;
+        const area = this._grab.win.get_workspace().get_work_area_for_monitor(monitor);
+        this._grab.drop = this._overlay.update(x, y, area, state, this._grab.win.get_id(), monitor);
     }
 
-    _cancelGeometryJob(win) {
-        if (!win || !this._geometryTimers)
-            return;
-
-        const id = win.get_id();
-        const sourceId = this._geometryTimers.get(id);
-
-        if (sourceId !== undefined) {
-            try {
-                GLib.Source.remove(sourceId);
-            } catch (_) {
+    _grabEnd(win) {
+        if (this._grab?.win !== win) return;
+        this._updateDrag();
+        const {moving, drop, cancelled} = this._grab;
+        this._stopDrag(false);
+        if (cancelled) {
+            this._validate(win);
+            const record = this._windows.get(win);
+            if (record) this._apply(record.group);
+        } else if (moving && drop) this._command(win, drop.zone, drop.layout, drop.monitor);
+        else if (moving) this._detach(win);
+        else {
+            this._validate(win);
+            const record = this._windows.get(win);
+            if (record) {
+                record.group.state = resize(record.group.state, win.get_id(), win.get_frame_rect(), this._area(record.group));
+                this._apply(record.group);
             }
-            this._geometryTimers.delete(id);
         }
+    }
 
-        this._pendingRects?.delete(id);
+    _stopDrag(validate = true) {
+        const grab = this._grab;
+        this._grab = null;
+        if (grab) grab.win.disconnect(grab.unmanaged);
+        if (this._dragTimer) GLib.Source.remove(this._dragTimer);
+        this._dragTimer = 0;
+        this._overlay?.hide();
+        if (validate && grab) this._validate(grab.win);
     }
 }

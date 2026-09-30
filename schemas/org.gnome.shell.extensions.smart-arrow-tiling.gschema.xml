@@ -15,12 +15,12 @@
 
     <key name="tile-up" type="as">
       <default><![CDATA[['<Super>Up']]]></default>
-      <summary>Complete a smart tiling sequence upward</summary>
+      <summary>Move to the upper slot or complete a diagonal sequence</summary>
     </key>
 
     <key name="tile-down" type="as">
       <default><![CDATA[['<Super>Down']]]></default>
-      <summary>Complete a smart tiling sequence downward</summary>
+      <summary>Move to the lower slot or complete a diagonal sequence</summary>
     </key>
 
   </schema>

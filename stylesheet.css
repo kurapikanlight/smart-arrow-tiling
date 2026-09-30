@@ -1,0 +1,16 @@
+.smart-arrow-selector {
+    background-color: rgba(48, 48, 52, 0.97);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 16px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
+}
+.smart-arrow-zone {
+    background-color: #626269;
+    border-radius: 4px;
+}
+.smart-arrow-zone:active { background-color: #3584e4; }
+.smart-arrow-preview {
+    background-color: rgba(53, 132, 228, 0.25);
+    border: 2px solid #3584e4;
+    border-radius: 10px;
+}
