@@ -1,9 +1,10 @@
 {
   "uuid": "smart-arrow-tiling@kafeyn",
   "name": "Smart Arrow Tiling",
-  "description": "Deterministic Super+Arrow tiling for GNOME Shell 50: halves, thirds, three-window layouts, quarters, linked resizing and a drag-to-top snap selector. Conflicting shortcuts are restored on disable.",
+  "description": "Deterministic Super+Arrow tiling for GNOME Shell 50–51: halves, thirds, three-window layouts, quarters, linked resizing and a drag-to-top snap selector. Conflicting shortcuts are restored on disable.",
   "shell-version": [
-    "50"
+    "50",
+    "51"
   ],
   "settings-schema": "org.gnome.shell.extensions.smart-arrow-tiling",
   "url": "https://github.com/kurapikanlight/smart-arrow-tiling"

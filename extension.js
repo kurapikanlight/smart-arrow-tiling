@@ -267,7 +267,13 @@ export default class SmartArrowTilingExtension extends Extension {
 
     _animateMove(win, record, target) {
         this._clearAnimation(record);
-        if (!record.animate || !St.Settings.get().enable_animations) return;
+        if (!record.animate) return;
+        const stSettings = St.Settings.get();
+        // GNOME 51+: respect the new St.ReducedMotion accessibility API.
+        // Fall back to the legacy enable_animations flag for GNOME 50.
+        if ('reducedMotion' in stSettings) {
+            if (stSettings.reducedMotion === St.ReducedMotion.REDUCE) return;
+        } else if (!stSettings.enable_animations) return;
         // Animate an owned snapshot, never the compositor's live actor or its
         // transforms. Native geometry is submitted once, without waiting for this.
         const actor = win.get_compositor_private();
